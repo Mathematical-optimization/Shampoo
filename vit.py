@@ -134,6 +134,40 @@ class VisionTransformer(nn.Module):
         return logits
 
 # --- 나머지 코드는 변경 없음 ---
+def gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size):
+    local_state = optimizer.distributed_state_dict(
+        key_to_param = model.module.named_parameters()
+    )
+
+    all_states = [None] * world_size
+    dist.all_gather_object(all_states, local_state)
+
+    if global_rank == 0:
+        merged_state = {'state': {}, 'param_groups' : local_state['param_groups']}
+
+        all_param_keys = set()
+        for state in all_states:
+            if 'state' in state:
+                all_param_keys.update(state['state'].keys())
+
+        for param_key in all_param_keys:
+            merged_state['state'][param_key] = {}
+
+            for rank, state in enumerate(all_states):
+                if 'state' in state and param_key in state['state']:
+                    param_state = state['state'][param_key]
+                    for key, value in param_state.items():
+                        if isinstance(value, torch.Tensor): 
+                            if value.numel() >0:
+                                if key not in merged_state['state'][param_key]:
+                                    merged_state['state'][param_key][key] = value
+                                elif merged_state['state'][param_key][key].numel() == 0:
+                                    merged_state['state'][param_key][key]= value
+                            else:
+                                if key not in merged_state['state'][param_key]:
+                                    merged_state['state'][param_key][key] = value
+        return merged_state
+    return None
 
 def get_warmup_cosine_decay_lr(current_step: int, base_lr: float, num_steps: int, warmup_steps: int) -> float:
     if current_step < warmup_steps:
@@ -231,11 +265,11 @@ def train(args: argparse.Namespace):
         momentum=False,
         weight_decay=args.weight_decay,
         max_preconditioner_dim=1024,
-        precondition_frequency=20,
+        precondition_frequency=10,
         use_normalized_grafting=False,
         inv_root_override=2,
         exponent_multiplier=1,
-        start_preconditioning_step=20,
+        start_preconditioning_step=10,
         use_nadam=False,
         use_decoupled_weight_decay=True,
         grafting_config=AdamGraftingConfig(beta2=0.995, epsilon=1e-8),
@@ -252,8 +286,14 @@ def train(args: argparse.Namespace):
             else:
                  model.module.load_state_dict(checkpoint)
             if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                print("=> loaded optimizer state")
+                try:
+                    optimizer.load_distributed_state_dict(
+                        checkpoint['optimizer_state_dict'],
+                        key_to_param=model.module.named_parameters()
+                    )
+                    print("=> loaded optimizer state")
+                except Exception as e:
+                    print(f"Error loading optimizer state: {e}")
             if 'epoch' in checkpoint:
                 start_epoch = checkpoint['epoch'] + 1
                 print(f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
@@ -325,17 +365,29 @@ def train(args: argparse.Namespace):
                 writer.add_scalar('validation_accuracy', accuracy, epoch)
                 writer.add_scalar('validation_loss', avg_val_loss, epoch)
 
-            if (epoch + 1) % args.save_interval == 0:
+        if (epoch + 1) % args.save_interval == 0:
+            print(f"Rank{global_rank}: Gathering optimizer states for checkpoint...")
+            merged_optimizer_state = gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size)
+            if global_rank == 0:
                 save_path = os.path.join(args.save_dir, f"vit_checkpoint_epoch_{epoch+1}.pth")
-                print(f"Saving checkpoint to {save_path}")
-                optimizer_state_dict = optimizer.distributed_state_dict(
-                    key_to_param=model.module.named_parameters()
-                )
+                print(f"Saving merged checkpoint to {save_path}")
+                total_params = len(merged_optimizer_state['state'])
+                non_empty_factors = 0
+                for param_key, param_state in merged_optimizer_state['state'].items():
+                    for key, value in param_state.items():
+                        if isinstance(value, torch.Tensor) and value.numel() > 0:
+                            if 'factor_matrices' in str(key):
+                                non_empty_factors += 1
+                print(f"Total parameters in optimizer state: {total_params}")
+                print(f"Parameters with non-empty factor matrices: {non_empty_factors}")
+
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.module.state_dict(),
-                    'optimizer_state_dict': optimizer_state_dict,
+                    'optimizer_state_dict': merged_optimizer_state,
                 }, save_path)
+            dist.barrier()
+
     if writer:
         writer.close()
     cleanup()
