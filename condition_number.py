@@ -6,14 +6,8 @@ import re
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import torch.distributed as dist
-from vit import VisionTransformer, DistributedShampoo
-from optimizers.distributed_shampoo.shampoo_types import (
-    AdamGraftingConfig,
-    DDPShampooConfig,
-)
-from torch.nn.parallel import DistributedDataParallel as DDP
-# vit.py에서 모델과 옵티마이저 정의를 가져옵니다.
-from vit import VisionTransformer, DistributedShampoo
+import numpy as np
+import json
 
 def plot_condition_number_trends(checkpoint_dir: str):
     """
@@ -24,13 +18,12 @@ def plot_condition_number_trends(checkpoint_dir: str):
         print(f"오류: 디렉토리를 찾을 수 없습니다 -> {checkpoint_dir}")
         return
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")  # CPU에서 분석
     print(f"분석을 위해 {device} 장치를 사용합니다.")
 
-    # 1. 체크포인트 파일 목록을 epoch 순서대로 정렬
+    # 체크포인트 파일 목록을 epoch 순서대로 정렬
     checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
     
-    # 'epoch_XX.pth' 또는 'vit_checkpoint_epoch_XX.pth' 패턴에서 숫자(epoch)를 추출하여 정렬
     try:
         checkpoint_files.sort(key=lambda f: int(re.search(r'epoch_(\d+)\.pth', f).group(1)))
     except (TypeError, AttributeError):
@@ -42,13 +35,11 @@ def plot_condition_number_trends(checkpoint_dir: str):
         return
 
     print(f"총 {len(checkpoint_files)}개의 체크포인트 파일을 분석합니다.")
-    print(checkpoint_files)
 
-    # 2. Condition Number 데이터를 저장할 딕셔너리
-    # 구조: results['파라미터명']['팩터 ID'] = [(epoch1, cond_num1), (epoch2, cond_num2), ...]
+    # Condition Number 데이터를 저장할 딕셔너리
     results = defaultdict(lambda: defaultdict(list))
 
-    # 3. 각 체크포인트를 순회하며 데이터 수집
+    # 각 체크포인트를 순회하며 데이터 수집
     for filename in checkpoint_files:
         checkpoint_path = os.path.join(checkpoint_dir, filename)
         epoch_match = re.search(r'epoch_(\d+)\.pth', filename)
@@ -64,160 +55,172 @@ def plot_condition_number_trends(checkpoint_dir: str):
             print(f"Epoch {epoch} 체크포인트 로딩 실패: {e}")
             continue
 
-        # 모델과 옵티마이저 초기화
-        model = VisionTransformer(img_size=224, patch_size=16, embedding_dim=384, depth=12, num_heads=6, mlp_dim=1536, num_classes=1000)
-        model.to(device)
-        if device.type == 'cuda':
-            model = DDP(model, device_ids=[device.index])
-        else:
-            model = DDP(model)
-            
-        optimizer = DistributedShampoo(
-            model.parameters(),
-            lr=0.0013,
-            betas=(0.95, 0.99),
-            epsilon=1e-8,
-            momentum=False,
-            weight_decay=0.0005,
-            max_preconditioner_dim=1024,
-            precondition_frequency=20,
-            use_normalized_grafting=False,
-            inv_root_override=2,
-            exponent_multiplier=1,
-            start_preconditioning_step=20,
-            use_nadam=False,
-            use_decoupled_weight_decay=True,
-            grafting_config=AdamGraftingConfig(beta2=0.995, epsilon=1e-8),
-            distributed_config=DDPShampooConfig()
-    )
-        try:
-            dummy_input = torch.randn(2,3,224,224, device = device)
-            dummy_labels = torch.randint(0, 1000, (2,), device = device)
-            optimizer.zero_grad()
-            outputs = model(dummy_input)
-            loss = nn.CrossEntropyLoss()(outputs, dummy_labels)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            print("옵티마이저 상태 초기화를 위한 더미 스텝 완료.")
-        except Exception as e:
-            print(f"더미 스텝 중 오류 발생: {e}")
-            
-
-        if 'model_state_dict' in checkpoint:
-            # DDP로 학습된 모델은 'module.' 접두사가 붙어있을 수 있으므로 제거
-            model_state = {k.replace('module.', ''): v for k, v in checkpoint['model_state_dict'].items()}
-            model.load_state_dict(model_state, strict=False)
-        
-        if 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
-            try:
-                optimizer.load_distributed_state_dict(
-                    state_dict=checkpoint['optimizer_state_dict'], 
-                    key_to_param=model.named_parameters()
-                )
-                print(f"Epoch {epoch} 옵티마이저 상태 로딩 성공!")
-            except Exception as e:
-                print(f"주의: Epoch {epoch} 옵티마이저 상태 로딩 중 오류 발생. 일부 Preconditioner 정보가 누락될 수 있습니다. (오류: {e})")
-                pass
-        else:
-            print(f"Epoch {epoch} 체크포인트에 옵티마이저 상태가 없어 건너뜁니다.")
+        # optimizer_state_dict에서 직접 정보 추출
+        if 'optimizer_state_dict' not in checkpoint:
+            print(f"Epoch {epoch}: optimizer_state_dict가 없습니다.")
             continue
             
-        param_map = {p: name for name, p in model.named_parameters()}
-
-        for param, state_dict in optimizer.state.items():
-            if param not in param_map:
-                continue
-            param_name = param_map.get(param)
+        optimizer_state = checkpoint['optimizer_state_dict']
+        
+        if 'state' not in optimizer_state:
+            print(f"Epoch {epoch}: optimizer state가 없습니다.")
+            continue
             
-            for key, value in state_dict.items():
-                if isinstance(key, str) and 'block' in key and 'shampoo' in value:
-                    shampoo_state = value['shampoo']
-                    if hasattr(shampoo_state, 'factor_matrices'):
-                        for i, factor_matrix in enumerate(shampoo_state.factor_matrices):
-                            # 컨디션 넘버 계산은 2D 정방 행렬에 대해서만 가능
-                            if factor_matrix.ndim == 2 and factor_matrix.shape[0] == factor_matrix.shape[1] and factor_matrix.numel() > 1:
-                                matrix_to_eval = factor_matrix.detach().to(torch.float64)
-                                # torch.linalg.cond가 0으로 된 행렬에 대해 발산하는 것을 방지
-                                matrix_to_eval += torch.eye(matrix_to_eval.shape[0], device=matrix_to_eval.device) * 1e-8
-                                cond_num = torch.linalg.cond(matrix_to_eval).item()
-                                
-                                # 결과 저장
-                                factor_id = f"{param_name}_{key}_factor_{i}"
-                                results[param_name][factor_id].append((epoch, cond_num))
+        state_dict = optimizer_state['state']
+        
+        # 각 파라미터의 상태 확인
+        for param_key, param_state in state_dict.items():
+            # Q, K, V projection 파라미터만 필터링
+            if not any(proj in param_key for proj in ['q_proj', 'k_proj', 'v_proj']):
+                continue
+            
+            # weight 파라미터만 처리 (bias 제외)
+            if 'weight' not in param_key:
+                continue
+                
+            # param_state의 구조를 파싱
+            for state_key, state_value in param_state.items():
+                # state_key가 JSON 형식인지 확인
+                if isinstance(state_key, str) and state_key.startswith('['):
+                    try:
+                        # JSON 파싱
+                        key_parts = json.loads(state_key)
+                        
+                        # Shampoo factor matrices 찾기
+                        if (isinstance(key_parts, list) and len(key_parts) >= 3 and 
+                            'shampoo' in key_parts and 'factor_matrices' in key_parts):
+                            
+                            # Factor index 추출
+                            factor_idx = key_parts[-1] if isinstance(key_parts[-1], int) else None
+                            
+                            if factor_idx is not None and isinstance(state_value, torch.Tensor):
+                                # 2D 정방 행렬이고 빈 텐서가 아닌지 확인
+                                if (state_value.ndim == 2 and 
+                                    state_value.shape[0] == state_value.shape[1] and 
+                                    state_value.shape[0] > 1 and
+                                    state_value.numel() > 0):
+                                    
+                                    try:
+                                        # 조건수 계산
+                                        matrix = state_value.detach().double()
+                                        matrix = matrix + torch.eye(matrix.shape[0], dtype=torch.float64) * 1e-10
+                                        cond_num = torch.linalg.cond(matrix).item()
+                                        
+                                        if not (np.isnan(cond_num) or np.isinf(cond_num)):
+                                            factor_id = f"factor_{factor_idx}"
+                                            results[param_key][factor_id].append((epoch, cond_num))
+                                            
+                                    except Exception as e:
+                                        pass
+                                        
+                    except json.JSONDecodeError:
+                        pass
     
-    # 4. 수집된 데이터로 그래프 시각화 (개선된 버전)
+    # 수집된 데이터로 그래프 시각화
     print("\n--- 모든 체크포인트 분석 완료. 그래프 생성 중... ---")
 
-    # Q, K, V 파라미터만 필터링
-    qkv_results = defaultdict(lambda: defaultdict(list))
+    # Attention 블록별로 그래프를 그룹화
+    block_plots = defaultdict(lambda: defaultdict(list))
+    
     for param_name, factors in results.items():
-        if 'q_proj' in param_name or 'k_proj' in param_name or 'v_proj' in param_name:
-            qkv_results[param_name] = factors
+        # encoder_blocks.X.attn 부분 추출
+        match = re.search(r'encoder_blocks\.(\d+)\.attn', param_name)
+        
+        if match:
+            block_idx = int(match.group(1))
+            
+            # Q, K, V 구분
+            if 'q_proj' in param_name:
+                proj_type = 'Query'
+            elif 'k_proj' in param_name:
+                proj_type = 'Key'
+            elif 'v_proj' in param_name:
+                proj_type = 'Value'
+            else:
+                continue
+                
+            for factor_id, data_points in factors.items():
+                factor_match = re.search(r'factor_(\d+)', factor_id)
+                if factor_match:
+                    factor_num = int(factor_match.group(1))
+                    block_plots[block_idx][(proj_type, factor_num)] = data_points
 
-    if not qkv_results:
-        print("분석할 Query, Key, Value 파라미터 데이터를 찾을 수 없습니다.")
-        return
-
-    # Attention 블록별로 그래프를 그룹화하기 위한 딕셔너리
-    # 구조: block_plots['encoder_blocks.0.attn'] = {'q_proj_...': [...], 'k_proj_...': [...]}
-    block_plots = defaultdict(dict)
-    for param_name, factors in qkv_results.items():
-        # 'encoder_blocks.0.attn.q_proj.weight' -> 'encoder_blocks.0.attn'
-        block_name = '.'.join(param_name.split('.')[:-2]) 
-        block_plots[block_name].update(factors)
-
-    num_blocks = len(block_plots)
-    if num_blocks == 0:
+    if not block_plots:
         print("Attention 블록 데이터를 찾을 수 없습니다.")
         return
+    
+    # 12개 블록에 대한 서브플롯 생성
+    num_blocks = 12  # ViT-S/16은 12개 블록
+    rows = 4
+    cols = 3
+    fig, axes = plt.subplots(rows, cols, figsize=(20, 20))
+    axes = axes.flatten()
+    
+    # 색상 매핑
+    color_map = {'Query': 'red', 'Key': 'green', 'Value': 'blue'}
+    linestyle_map = {0: '-', 1: '--'}  # Factor 0은 실선, Factor 1은 점선
+    
+    for block_idx in range(num_blocks):
+        ax = axes[block_idx]
         
-    fig, axes = plt.subplots(num_blocks, 1, figsize=(15, 8 * num_blocks), sharex=True)
-    if num_blocks == 1:
-        axes = [axes]
-
-    # 각 Attention 블록별로 subplot 생성
-    for ax, (block_name, factors) in zip(axes, sorted(block_plots.items())):
-        for factor_id, data_points in sorted(factors.items()):
-            if data_points:
-                epochs, cond_nums = zip(*sorted(data_points))
-                # '...q_proj.weight_block_0_factor_0' -> 'q_proj.weight_..._factor_0'
-                label_suffix = factor_id.split(block_name + '.')[1]
-                
-                # Q, K, V에 따라 색상 지정
-                color = 'r' if 'q_proj' in label_suffix else 'g' if 'k_proj' in label_suffix else 'b'
-                linestyle = '--' if 'factor_1' in label_suffix else '-'
-                
-                ax.plot(epochs, cond_nums, marker='o', linestyle=linestyle, label=label_suffix, color=color)
-        
-        ax.set_yscale('log')
-        ax.set_title(f"Condition Number Trend for '{block_name}'")
-        ax.set_ylabel("Condition Number (log scale)")
-        ax.legend(fontsize='small', loc='upper left')
-        ax.grid(True, which="both", ls="--")
-
-    axes[-1].set_xlabel("Epoch")
+        if block_idx in block_plots:
+            block_data = block_plots[block_idx]
+            
+            # 각 projection type과 factor에 대해 플롯
+            for (proj_type, factor_num), data_points in sorted(block_data.items()):
+                if data_points:
+                    epochs, cond_nums = zip(*sorted(data_points))
+                    
+                    label = f"{proj_type} (Factor {factor_num})"
+                    
+                    ax.semilogy(epochs, cond_nums, 
+                               marker='o', 
+                               linestyle=linestyle_map.get(factor_num, ':'),
+                               label=label,
+                               color=color_map.get(proj_type, 'black'),
+                               linewidth=2,
+                               markersize=5,
+                               alpha=0.8)
+            
+            ax.set_title(f"Block {block_idx}", fontsize=12, fontweight='bold')
+            ax.set_xlabel("Epoch", fontsize=10)
+            ax.set_ylabel("Condition Number", fontsize=10)
+            ax.legend(loc='best', fontsize=8)
+            ax.grid(True, which="both", ls="--", alpha=0.3)
+            ax.set_ylim(bottom=1e0)
+        else:
+            ax.set_title(f"Block {block_idx} (No Data)", fontsize=12)
+            ax.text(0.5, 0.5, "No data available", ha='center', va='center')
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+    
+    plt.suptitle("Shampoo Preconditioner Condition Numbers for All Transformer Blocks", 
+                 fontsize=16, fontweight='bold')
     plt.tight_layout()
     
-    save_path = "qkv_condition_number_trends.png"
-    plt.savefig(save_path)
-    print(f"\nQ/K/V 그래프가 '{save_path}' 파일로 저장되었습니다.")
-
+    save_path = os.path.join(os.path.dirname(checkpoint_dir), "qkv_condition_numbers_all_blocks.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\n그래프가 '{save_path}' 파일로 저장되었습니다.")
+    
+    # 통계 정보 출력
+    print("\n=== 조건수 통계 (모든 블록) ===")
+    for block_idx in sorted(block_plots.keys()):
+        print(f"\nBlock {block_idx}:")
+        block_data = block_plots[block_idx]
+        
+        for proj_type in ['Query', 'Key', 'Value']:
+            for factor_num in [0, 1]:
+                if (proj_type, factor_num) in block_data:
+                    _, cond_nums = zip(*block_data[(proj_type, factor_num)])
+                    print(f"  {proj_type} Factor {factor_num}: "
+                          f"min={min(cond_nums):.2e}, max={max(cond_nums):.2e}, "
+                          f"mean={np.mean(cond_nums):.2e}")
 
 if __name__ == '__main__':
-    # 분산 환경에서 저장된 체크포인트를 로드하기 위해 가짜 분산 환경 설정
-    if not dist.is_initialized():
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        # 'nccl' 백엔드는 CUDA가 필요하므로, CPU만 있는 환경에서는 'gloo' 사용
-        backend = 'gloo' if not torch.cuda.is_available() else 'nccl'
-        dist.init_process_group(backend=backend, rank=0, world_size=1)
-        
+    # 단일 프로세스로 실행 (분산 환경 설정 불필요)
     parser = argparse.ArgumentParser(description='Plot Shampoo Preconditioner Condition Number trends from checkpoints.')
-    parser.add_argument('--checkpoint-dir', type=str, required=True, help='Directory containing the .pth checkpoint files.')
+    parser.add_argument('--checkpoint-dir', type=str, required=True, 
+                       help='Directory containing the .pth checkpoint files.')
     args = parser.parse_args()
     
     plot_condition_number_trends(args.checkpoint_dir)
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
