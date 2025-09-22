@@ -1,4 +1,5 @@
 import os
+from xml.parsers.expat import model
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +17,6 @@ import functools
 # Hugging Face datasets 라이브러리 import
 from datasets import load_dataset
 from PIL import Image
-
 # timm 라이브러리 import
 try:
     from timm.data import create_transform, Mixup
@@ -29,6 +29,7 @@ from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampo
 from optimizers.distributed_shampoo.shampoo_types import (
     AdamGraftingConfig,
     DDPShampooConfig,
+    CommunicationDType
 )
 
 # --- ViT 모델 코드 수정 ---
@@ -134,39 +135,140 @@ class VisionTransformer(nn.Module):
         return logits
 
 # --- 나머지 코드는 변경 없음 ---
-def gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size):
-    local_state = optimizer.distributed_state_dict(
-        key_to_param = model.module.named_parameters()
-    )
+def validate_checkpoint_completeness(optimizer_state, model):
+    """체크포인트가 모든 필요한 정보를 포함하는지 검증"""
+    expected_qkv_params = 0
+    found_qkv_factor_matrices = 0
+    
+    for name, param in model.named_parameters():
+        if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj']) and 'weight' in name:
+            expected_qkv_params += 1
+            
+            if name in optimizer_state['state']:
+                param_state = optimizer_state['state'][name]
+                for key in param_state:
+                    if isinstance(key, str) and 'factor_matrices' in key:
+                        if isinstance(param_state[key], torch.Tensor) and param_state[key].numel() > 0:
+                            found_qkv_factor_matrices += 1
+    
+    print(f"\n=== 체크포인트 완전성 검증 ===")
+    print(f"예상 Q/K/V 파라미터 수: {expected_qkv_params}")
+    print(f"Factor matrices를 가진 Q/K/V 파라미터: {found_qkv_factor_matrices // 2}")  # 각 파라미터당 2개의 factor
+    
+    if found_qkv_factor_matrices < expected_qkv_params * 2:
+        print("⚠️ 경고: 일부 factor matrices가 누락되었을 수 있습니다!")
+    else:
+        print("✅ 모든 factor matrices가 정상적으로 수집되었습니다.")
 
+
+def gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size):
+    """
+    모든 랭크에서 옵티마이저 상태를 수집하고 통합합니다.
+    Distributed Shampoo의 분산된 factor matrices를 올바르게 처리합니다.
+    """
+    # 로컬 상태 수집
+    local_state = optimizer.distributed_state_dict(
+        key_to_param=model.module.named_parameters()
+    )
+    
+    # 모든 랭크에서 상태 수집
     all_states = [None] * world_size
     dist.all_gather_object(all_states, local_state)
-
+    
     if global_rank == 0:
-        merged_state = {'state': {}, 'param_groups' : local_state['param_groups']}
-
+        merged_state = {
+            'state': {},
+            'param_groups': local_state['param_groups']
+        }
+        
+        # 모든 파라미터 키 수집
         all_param_keys = set()
         for state in all_states:
             if 'state' in state:
                 all_param_keys.update(state['state'].keys())
-
+        
+        print(f"총 {len(all_param_keys)}개의 파라미터 발견")
+        
+        # 각 파라미터에 대해 상태 통합
         for param_key in all_param_keys:
             merged_state['state'][param_key] = {}
-
-            for rank, state in enumerate(all_states):
+            param_state_keys = set()
+            
+            # 모든 랭크에서 이 파라미터의 모든 state key 수집
+            for state in all_states:
                 if 'state' in state and param_key in state['state']:
-                    param_state = state['state'][param_key]
-                    for key, value in param_state.items():
-                        if isinstance(value, torch.Tensor): 
-                            if value.numel() >0:
-                                if key not in merged_state['state'][param_key]:
-                                    merged_state['state'][param_key][key] = value
-                                elif merged_state['state'][param_key][key].numel() == 0:
-                                    merged_state['state'][param_key][key]= value
+                    param_state_keys.update(state['state'][param_key].keys())
+            
+            # 각 state key에 대해 처리
+            for state_key in param_state_keys:
+                merged_value = None
+                is_factor_matrix = False
+                
+                # state_key가 factor_matrices를 포함하는지 확인
+                if isinstance(state_key, str) and 'factor_matrices' in state_key:
+                    is_factor_matrix = True
+                
+                # 모든 랭크에서 이 state_key의 값을 수집
+                for rank, state in enumerate(all_states):
+                    if ('state' in state and 
+                        param_key in state['state'] and 
+                        state_key in state['state'][param_key]):
+                        
+                        value = state['state'][param_key][state_key]
+                        
+                        # Tensor 처리
+                        if isinstance(value, torch.Tensor):
+                            # DTensor 처리 (만약 DTensor가 사용되는 경우)
+                            if hasattr(value, '_local_tensor'):
+                                value = value._local_tensor
+                            
+                            # Factor matrix의 경우 특별 처리
+                            if is_factor_matrix:
+                                # 빈 텐서가 아닌 경우만 저장
+                                if value.numel() > 0:
+                                    if merged_value is None:
+                                        merged_value = value.clone()
+                                    elif merged_value.numel() == 0:
+                                        # 이전에 빈 텐서였다면 교체
+                                        merged_value = value.clone()
+                                    # 디버깅 정보
+                                    print(f"  Rank {rank}: {param_key}/{state_key} - shape: {value.shape}, numel: {value.numel()}")
                             else:
-                                if key not in merged_state['state'][param_key]:
-                                    merged_state['state'][param_key][key] = value
+                                # Factor matrix가 아닌 경우
+                                if merged_value is None or (merged_value.numel() == 0 and value.numel() > 0):
+                                    merged_value = value.clone()
+                        else:
+                            # Tensor가 아닌 경우
+                            if merged_value is None:
+                                merged_value = value
+                
+                # 최종 값 저장
+                if merged_value is not None:
+                    merged_state['state'][param_key][state_key] = merged_value
+        
+        # 검증: factor matrices 수집 상태 확인
+        print("\n=== Factor Matrices 수집 검증 ===")
+        total_factor_matrices = 0
+        non_empty_factor_matrices = 0
+        qkv_factor_matrices = 0
+        
+        for param_key, param_state in merged_state['state'].items():
+            for state_key, value in param_state.items():
+                if isinstance(state_key, str) and 'factor_matrices' in state_key:
+                    total_factor_matrices += 1
+                    if isinstance(value, torch.Tensor) and value.numel() > 0:
+                        non_empty_factor_matrices += 1
+                        # Q/K/V 파라미터인지 확인
+                        if any(proj in param_key for proj in ['q_proj', 'k_proj', 'v_proj']):
+                            qkv_factor_matrices += 1
+                            print(f"  ✓ {param_key}/{state_key}: shape={value.shape}")
+        
+        print(f"총 Factor Matrices: {total_factor_matrices}")
+        print(f"비어있지 않은 Factor Matrices: {non_empty_factor_matrices}")
+        print(f"Q/K/V Projection의 Factor Matrices: {qkv_factor_matrices}")
+        
         return merged_state
+    
     return None
 
 def get_warmup_cosine_decay_lr(current_step: int, base_lr: float, num_steps: int, warmup_steps: int) -> float:
@@ -273,7 +375,11 @@ def train(args: argparse.Namespace):
         use_nadam=False,
         use_decoupled_weight_decay=True,
         grafting_config=AdamGraftingConfig(beta2=0.995, epsilon=1e-8),
-        distributed_config=DDPShampooConfig()
+        distributed_config=DDPShampooConfig(
+            communication_dtype = CommunicationDType.FP32,
+            num_trainers_per_group = -1,
+            communicate_params=False
+        )
     )
     
     start_epoch = 0
@@ -366,26 +472,22 @@ def train(args: argparse.Namespace):
                 writer.add_scalar('validation_loss', avg_val_loss, epoch)
 
         if (epoch + 1) % args.save_interval == 0:
-            print(f"Rank{global_rank}: Gathering optimizer states for checkpoint...")
+            print(f"Rank {global_rank}: Gathering optimizer states for checkpoint...")
             merged_optimizer_state = gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size)
+    
             if global_rank == 0:
+                # 체크포인트 검증
+                validate_checkpoint_completeness(merged_optimizer_state, model.module)
+        
                 save_path = os.path.join(args.save_dir, f"vit_checkpoint_epoch_{epoch+1}.pth")
                 print(f"Saving merged checkpoint to {save_path}")
-                total_params = len(merged_optimizer_state['state'])
-                non_empty_factors = 0
-                for param_key, param_state in merged_optimizer_state['state'].items():
-                    for key, value in param_state.items():
-                        if isinstance(value, torch.Tensor) and value.numel() > 0:
-                            if 'factor_matrices' in str(key):
-                                non_empty_factors += 1
-                print(f"Total parameters in optimizer state: {total_params}")
-                print(f"Parameters with non-empty factor matrices: {non_empty_factors}")
-
+        
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.module.state_dict(),
                     'optimizer_state_dict': merged_optimizer_state,
                 }, save_path)
+    
             dist.barrier()
 
     if writer:
