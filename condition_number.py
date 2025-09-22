@@ -5,7 +5,6 @@ import os
 import re
 import matplotlib.pyplot as plt
 from collections import defaultdict
-import torch.distributed as dist
 import numpy as np
 import json
 
@@ -69,86 +68,73 @@ def plot_condition_number_trends(checkpoint_dir: str):
         state_dict = optimizer_state['state']
         
         # 각 파라미터의 상태 확인
-        for param_key, param_state in state_dict.items():
-            # Q, K, V projection 파라미터만 필터링
-            if not any(proj in param_key for proj in ['q_proj', 'k_proj', 'v_proj']):
-                continue
-            
-            # weight 파라미터만 처리 (bias 제외)
-            if 'weight' not in param_key:
-                continue
-                
-            # param_state의 구조를 파싱
-            for state_key, state_value in param_state.items():
-                # state_key가 JSON 형식인지 확인
-                if isinstance(state_key, str) and state_key.startswith('['):
-                    try:
-                        # JSON 파싱
-                        key_parts = json.loads(state_key)
-                        
-                        # Shampoo factor matrices 찾기
-                        if (isinstance(key_parts, list) and len(key_parts) >= 3 and 
-                            'shampoo' in key_parts and 'factor_matrices' in key_parts):
+        for param_name, param_state in state_dict.items():
+            # encoder_blocks의 attention 파라미터만 필터링 (CustomMultiheadAttention의 q_proj, k_proj, v_proj)
+            if 'encoder_blocks' in param_name and 'attn' in param_name and any(proj in param_name for proj in ['q_proj', 'k_proj', 'v_proj']):
+                if 'weight' not in param_name:
+                    continue
+                    
+                # param_state의 구조를 파싱
+                for state_key, state_value in param_state.items():
+                    # state_key가 JSON 형식인지 확인
+                    if isinstance(state_key, str) and state_key.startswith('['):
+                        try:
+                            # JSON 파싱
+                            key_parts = json.loads(state_key)
                             
-                            # Factor index 추출
-                            factor_idx = key_parts[-1] if isinstance(key_parts[-1], int) else None
-                            
-                            if factor_idx is not None and isinstance(state_value, torch.Tensor):
-                                # 2D 정방 행렬이고 빈 텐서가 아닌지 확인
-                                if (state_value.ndim == 2 and 
-                                    state_value.shape[0] == state_value.shape[1] and 
-                                    state_value.shape[0] > 1 and
-                                    state_value.numel() > 0):
-                                    
-                                    try:
-                                        # 조건수 계산
-                                        matrix = state_value.detach().double()
-                                        matrix = matrix + torch.eye(matrix.shape[0], dtype=torch.float64) * 1e-10
-                                        cond_num = torch.linalg.cond(matrix).item()
+                            # Shampoo factor matrices 찾기
+                            if (isinstance(key_parts, list) and len(key_parts) >= 3 and 
+                                'shampoo' in key_parts and 'factor_matrices' in key_parts):
+                                
+                                # Factor index 추출
+                                factor_idx = key_parts[-1] if isinstance(key_parts[-1], int) else None
+                                
+                                if factor_idx is not None and isinstance(state_value, torch.Tensor):
+                                    # 2D 정방 행렬이고 빈 텐서가 아닌지 확인
+                                    if (state_value.ndim == 2 and 
+                                        state_value.shape[0] == state_value.shape[1] and 
+                                        state_value.shape[0] > 1 and
+                                        state_value.numel() > 0):
                                         
-                                        if not (np.isnan(cond_num) or np.isinf(cond_num)):
-                                            factor_id = f"factor_{factor_idx}"
-                                            results[param_key][factor_id].append((epoch, cond_num))
+                                        try:
+                                            # 조건수 계산
+                                            matrix = state_value.detach().double()
+                                            # 수치 안정성을 위해 작은 값 추가
+                                            matrix = matrix + torch.eye(matrix.shape[0], dtype=torch.float64) * 1e-10
+                                            cond_num = torch.linalg.cond(matrix).item()
                                             
-                                    except Exception as e:
-                                        pass
-                                        
-                    except json.JSONDecodeError:
-                        pass
+                                            if not (np.isnan(cond_num) or np.isinf(cond_num)):
+                                                # 파라미터 이름 파싱
+                                                match = re.search(r'encoder_blocks\.(\d+)\.attn\.(q_proj|k_proj|v_proj)\.weight', param_name)
+                                                if match:
+                                                    block_idx = int(match.group(1))
+                                                    proj_type = match.group(2)
+                                                    
+                                                    if proj_type == 'q_proj':
+                                                        proj_name = 'Query'
+                                                    elif proj_type == 'k_proj':
+                                                        proj_name = 'Key'
+                                                    else:
+                                                        proj_name = 'Value'
+                                                    
+                                                    key = f"Block_{block_idx}_{proj_name}_Factor_{factor_idx}"
+                                                    results[key]['epochs'].append(epoch)
+                                                    results[key]['cond_nums'].append(cond_num)
+                                                    print(f"  {key}: {cond_num:.2e}")
+                                                
+                                        except Exception as e:
+                                            print(f"  조건수 계산 실패: {e}")
+                                            
+                        except json.JSONDecodeError:
+                            pass
     
     # 수집된 데이터로 그래프 시각화
     print("\n--- 모든 체크포인트 분석 완료. 그래프 생성 중... ---")
 
-    # Attention 블록별로 그래프를 그룹화
-    block_plots = defaultdict(lambda: defaultdict(list))
-    
-    for param_name, factors in results.items():
-        # encoder_blocks.X.attn 부분 추출
-        match = re.search(r'encoder_blocks\.(\d+)\.attn', param_name)
-        
-        if match:
-            block_idx = int(match.group(1))
-            
-            # Q, K, V 구분
-            if 'q_proj' in param_name:
-                proj_type = 'Query'
-            elif 'k_proj' in param_name:
-                proj_type = 'Key'
-            elif 'v_proj' in param_name:
-                proj_type = 'Value'
-            else:
-                continue
-                
-            for factor_id, data_points in factors.items():
-                factor_match = re.search(r'factor_(\d+)', factor_id)
-                if factor_match:
-                    factor_num = int(factor_match.group(1))
-                    block_plots[block_idx][(proj_type, factor_num)] = data_points
-
-    if not block_plots:
-        print("Attention 블록 데이터를 찾을 수 없습니다.")
+    if not results:
+        print("분석할 데이터가 없습니다. Q/K/V projection weights의 factor matrices를 찾을 수 없습니다.")
         return
-    
+
     # 12개 블록에 대한 서브플롯 생성
     num_blocks = 12  # ViT-S/16은 12개 블록
     rows = 4
@@ -162,26 +148,28 @@ def plot_condition_number_trends(checkpoint_dir: str):
     
     for block_idx in range(num_blocks):
         ax = axes[block_idx]
+        has_data = False
         
-        if block_idx in block_plots:
-            block_data = block_plots[block_idx]
-            
-            # 각 projection type과 factor에 대해 플롯
-            for (proj_type, factor_num), data_points in sorted(block_data.items()):
-                if data_points:
-                    epochs, cond_nums = zip(*sorted(data_points))
-                    
-                    label = f"{proj_type} (Factor {factor_num})"
+        # 각 projection type과 factor에 대해 플롯
+        for proj_type in ['Query', 'Key', 'Value']:
+            for factor_idx in [0, 1]:
+                key = f"Block_{block_idx}_{proj_type}_Factor_{factor_idx}"
+                
+                if key in results and results[key]['epochs']:
+                    epochs = results[key]['epochs']
+                    cond_nums = results[key]['cond_nums']
                     
                     ax.semilogy(epochs, cond_nums, 
                                marker='o', 
-                               linestyle=linestyle_map.get(factor_num, ':'),
-                               label=label,
-                               color=color_map.get(proj_type, 'black'),
+                               linestyle=linestyle_map[factor_idx],
+                               label=f"{proj_type} (Factor {factor_idx})",
+                               color=color_map[proj_type],
                                linewidth=2,
                                markersize=5,
                                alpha=0.8)
-            
+                    has_data = True
+        
+        if has_data:
             ax.set_title(f"Block {block_idx}", fontsize=12, fontweight='bold')
             ax.set_xlabel("Epoch", fontsize=10)
             ax.set_ylabel("Condition Number", fontsize=10)
@@ -191,8 +179,6 @@ def plot_condition_number_trends(checkpoint_dir: str):
         else:
             ax.set_title(f"Block {block_idx} (No Data)", fontsize=12)
             ax.text(0.5, 0.5, "No data available", ha='center', va='center')
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1)
     
     plt.suptitle("Shampoo Preconditioner Condition Numbers for All Transformer Blocks", 
                  fontsize=16, fontweight='bold')
@@ -203,21 +189,14 @@ def plot_condition_number_trends(checkpoint_dir: str):
     print(f"\n그래프가 '{save_path}' 파일로 저장되었습니다.")
     
     # 통계 정보 출력
-    print("\n=== 조건수 통계 (모든 블록) ===")
-    for block_idx in sorted(block_plots.keys()):
-        print(f"\nBlock {block_idx}:")
-        block_data = block_plots[block_idx]
-        
-        for proj_type in ['Query', 'Key', 'Value']:
-            for factor_num in [0, 1]:
-                if (proj_type, factor_num) in block_data:
-                    _, cond_nums = zip(*block_data[(proj_type, factor_num)])
-                    print(f"  {proj_type} Factor {factor_num}: "
-                          f"min={min(cond_nums):.2e}, max={max(cond_nums):.2e}, "
-                          f"mean={np.mean(cond_nums):.2e}")
+    print("\n=== 조건수 통계 ===")
+    for key in sorted(results.keys()):
+        if results[key]['cond_nums']:
+            cond_nums = results[key]['cond_nums']
+            print(f"{key}:")
+            print(f"  최소: {min(cond_nums):.2e}, 최대: {max(cond_nums):.2e}, 평균: {np.mean(cond_nums):.2e}")
 
 if __name__ == '__main__':
-    # 단일 프로세스로 실행 (분산 환경 설정 불필요)
     parser = argparse.ArgumentParser(description='Plot Shampoo Preconditioner Condition Number trends from checkpoints.')
     parser.add_argument('--checkpoint-dir', type=str, required=True, 
                        help='Directory containing the .pth checkpoint files.')
