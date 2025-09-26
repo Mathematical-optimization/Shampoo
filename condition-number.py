@@ -1,4 +1,4 @@
-# condition_number.py
+# condition-number.py
 # Transformer + WMT2017 dataset
 
 import torch
