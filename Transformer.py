@@ -46,13 +46,14 @@ class PositionalEncoding(nn.Module):
                            (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        # [수정] .contiguous()를 호출하여 DDP 동기화 오류를 해결합니다.
-        self.register_buffer('pe', pe.contiguous())
+        # 완전히 새로운 텐서로 만들기
+        pe = pe.unsqueeze(0).transpose(0, 1).clone().detach()
+        self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [seq_len, batch_size, d_model]"""
-        return x + self.pe[:x.size(0)]
+        # pe도 clone하여 사용
+        return x + self.pe[:x.size(0)].clone()
 
 
 class CustomMultiheadAttention(nn.Module):
@@ -141,7 +142,9 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.pad_idx = pad_idx
         self.shared_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
+        # Encoder와 Decoder용 별도의 PositionalEncoding 생성
+        self.encoder_pos_encoding = PositionalEncoding(d_model, max_seq_len)
+        self.decoder_pos_encoding = PositionalEncoding(d_model, max_seq_len)
         self.encoder_layers = nn.ModuleList([
             TransformerEncoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_encoder_layers)
         ])
@@ -168,7 +171,7 @@ class Transformer(nn.Module):
     def encode(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.shared_embedding(src) * math.sqrt(self.d_model)
         x = x.transpose(0, 1)
-        x = self.pos_encoding(x)
+        x = self.encoder_pos_encoding(x)  # encoder용 사용
         x = self.dropout(x)
         for layer in self.encoder_layers:
             x = layer(x, src_mask)
@@ -179,7 +182,7 @@ class Transformer(nn.Module):
                src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.shared_embedding(tgt) * math.sqrt(self.d_model)
         x = x.transpose(0, 1)
-        x = self.pos_encoding(x)
+        x = self.decoder_pos_encoding(x)  # decoder용 사용
         x = self.dropout(x)
         for layer in self.decoder_layers:
             x = layer(x, encoder_output, tgt_mask, src_mask)
@@ -216,8 +219,8 @@ class WMT17Dataset(Dataset):
 
 def create_data_loaders(args, tokenizer, global_rank, world_size):
     if global_rank == 0: print("Loading WMT datasets...")
-    dataset = load_dataset("wmt17", "de-en", cache_dir=args.data_path, trust_remote_code=True)
-    val_dataset_raw = load_dataset("wmt14", "de-en", cache_dir=args.data_path, trust_remote_code=True)
+    dataset = load_dataset("wmt17", "de-en", cache_dir=args.data_path)
+    val_dataset_raw = load_dataset("wmt14", "de-en", cache_dir=args.data_path)
     train_data = dataset['train']
     if args.max_train_samples:
         train_data = train_data.select(range(min(args.max_train_samples, len(train_data))))
@@ -352,6 +355,22 @@ def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_dir, gl
     if global_rank == 0:
         print(f"Distributed checkpoint saved to {checkpoint_dir}")
 
+def save_checkpoint_for_condition_number(model, optimizer, epoch, checkpoint_path, global_rank):
+    """Save checkpoint in standard format for condition-number.py analysis."""
+    if global_rank == 0:
+        # Rank 0에서 전체 optimizer state를 수집하여 저장
+        optimizer_state_dict = optimizer.distributed_state_dict(key_to_param=model.named_parameters())
+        
+        # condition-number.py가 기대하는 형식으로 변환
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.module.state_dict(),  # DDP unwrap
+            'optimizer_state_dict': optimizer_state_dict,
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Standard checkpoint saved to {checkpoint_path} for condition number analysis")
+
 def main(args):
     local_rank = setup()
     global_rank = dist.get_rank()
@@ -362,6 +381,7 @@ def main(args):
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir) if global_rank == 0 else None
 
+    global tokenizer  # global로 선언하여 다른 함수에서도 사용 가능
     tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
     train_loader, val_loader = create_data_loaders(args, tokenizer, global_rank, world_size)
 
@@ -371,7 +391,8 @@ def main(args):
         max_seq_len=args.max_seq_len, dropout=args.dropout,
         pad_idx=tokenizer.pad_token_id
     ).to(local_rank)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, 
+                find_unused_parameters=False, broadcast_buffers=False)  # broadcast_buffers 비활성화
 
     optimizer = DistributedShampoo(
         model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2),
@@ -417,10 +438,14 @@ def main(args):
             best_bleu = bleu_score
             if global_rank == 0: print(f"*** New best BLEU: {best_bleu:.2f} ***")
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu, os.path.join(args.checkpoint_dir, "best_model"), global_rank)
+            # condition-number.py를 위한 표준 체크포인트 저장
+            save_checkpoint_for_condition_number(model, optimizer, epoch, os.path.join(args.checkpoint_dir, f"best_model_epoch_{epoch+1}.pth"), global_rank)
 
         if (epoch + 1) % args.save_interval == 0:
             checkpoint_dir = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}")
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu, checkpoint_dir, global_rank)
+            # condition-number.py를 위한 표준 체크포인트 저장
+            save_checkpoint_for_condition_number(model, optimizer, epoch, os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"), global_rank)
 
     if global_rank == 0:
         print(f"\n{'='*50}\nTraining completed! Best BLEU score: {best_bleu:.2f}\n{'='*50}")
