@@ -1,322 +1,252 @@
-# condition-number.py
-# Transformer + WMT2017 dataset
-
 import torch
 import torch.nn as nn
-import numpy as np
 import argparse
-from pathlib import Path
+import os
+import re
+import matplotlib.pyplot as plt
+from collections import defaultdict
+import numpy as np
 import json
 
-def get_condition_numbers_from_shampoo(model, optimizer):
-    """
-    Shampoo optimizer의 preconditioner condition number 추출
-    """
-    condition_numbers = {}
-    
-    # optimizer state 확인
-    for param_group in optimizer.param_groups:
-        for param in param_group['params']:
-            if param in optimizer.state:
-                state = optimizer.state[param]
-                
-                # Shampoo는 preconditioner matrices를 저장함
-                if 'preconditioner_left' in state or 'preconditioner_right' in state:
-                    param_name = None
-                    
-                    # 파라미터 이름 찾기
-                    for name, module_param in model.named_parameters():
-                        if module_param is param:
-                            param_name = name
-                            break
-                    
-                    if param_name and any(key in param_name for key in ['q_proj', 'k_proj', 'v_proj']):
-                        cond_info = {}
-                        
-                        # Left preconditioner (row space)
-                        if 'preconditioner_left' in state:
-                            P_left = state['preconditioner_left']
-                            if P_left is not None:
-                                try:
-                                    eigenvalues = torch.linalg.eigvalsh(P_left)
-                                    max_eig = eigenvalues.max().item()
-                                    min_eig = eigenvalues[eigenvalues > 1e-10].min().item()  # 0이 아닌 최소값
-                                    cond_left = max_eig / min_eig if min_eig > 0 else float('inf')
-                                    cond_info['left_preconditioner'] = {
-                                        'condition_number': cond_left,
-                                        'max_eigenvalue': max_eig,
-                                        'min_eigenvalue': min_eig,
-                                        'shape': list(P_left.shape)
-                                    }
-                                except:
-                                    cond_info['left_preconditioner'] = 'Error computing'
-                        
-                        # Right preconditioner (column space)
-                        if 'preconditioner_right' in state:
-                            P_right = state['preconditioner_right']
-                            if P_right is not None:
-                                try:
-                                    eigenvalues = torch.linalg.eigvalsh(P_right)
-                                    max_eig = eigenvalues.max().item()
-                                    min_eig = eigenvalues[eigenvalues > 1e-10].min().item()
-                                    cond_right = max_eig / min_eig if min_eig > 0 else float('inf')
-                                    cond_info['right_preconditioner'] = {
-                                        'condition_number': cond_right,
-                                        'max_eigenvalue': max_eig,
-                                        'min_eigenvalue': min_eig,
-                                        'shape': list(P_right.shape)
-                                    }
-                                except:
-                                    cond_info['right_preconditioner'] = 'Error computing'
-                        
-                        # Kronecker product의 전체 condition number 추정
-                        if 'left_preconditioner' in cond_info and 'right_preconditioner' in cond_info:
-                            if isinstance(cond_info['left_preconditioner'], dict) and \
-                               isinstance(cond_info['right_preconditioner'], dict):
-                                total_cond = cond_info['left_preconditioner']['condition_number'] * \
-                                           cond_info['right_preconditioner']['condition_number']
-                                cond_info['total_condition_number'] = total_cond
-                        
-                        condition_numbers[param_name] = cond_info
-    
-    return condition_numbers
+def inspect_checkpoint_structure(checkpoint_path: str, verbose: bool = False):
+    """체크포인트 구조를 확인하고 디버깅 정보를 출력합니다."""
+    print("\n=== Checkpoint Structure Inspection ===")
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        print(f"Successfully loaded checkpoint: {checkpoint_path}")
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return None
 
+    if verbose:
+        print(f"Top-level keys: {list(checkpoint.keys())}")
 
-def analyze_attention_layers(checkpoint_path, output_file='condition_analysis.json'):
-    """
-    체크포인트에서 attention layer의 condition number 분석
-    """
-    # 체크포인트 로드
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
-    # 모델 재구성 (필요한 경우)
-    from Transformer import Transformer
-    from transformers import AutoTokenizer
-    
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
-    vocab_size = len(tokenizer)
-    
-    # 모델 생성
-    model = Transformer(
-        vocab_size=vocab_size,
-        d_model=256,  # 또는 체크포인트에서 로드
-        n_heads=4,
-        n_encoder_layers=4,
-        n_decoder_layers=4,
-        d_ff=1024,
-        max_seq_len=128,
-        dropout=0.1,
-        label_smoothing=0.1,
-        pad_idx=tokenizer.pad_token_id
-    )
-    
-    # 모델 state dict 로드
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Optimizer state 로드 및 분석
-    results = {
-        'encoder_layers': {},
-        'decoder_layers': {},
-        'summary': {}
+    structure_info = {
+        'has_optimizer_state': False,
+        'has_state_dict': False,
+        'param_count': 0,
+        'factor_matrix_count': 0,
+        'sample_keys': []
     }
-    
+
     if 'optimizer_state_dict' in checkpoint:
-        optimizer_state = checkpoint['optimizer_state_dict']
+        structure_info['has_optimizer_state'] = True
+        opt_state = checkpoint['optimizer_state_dict']
+
+        if 'state' in opt_state:
+            structure_info['has_state_dict'] = True
+            param_states = opt_state['state']
+            structure_info['param_count'] = len(param_states)
+
+            # attention 관련 파라미터 찾기
+            for param_name, param_state in param_states.items():
+                if 'attn' in param_name and any(p in param_name for p in ['q_proj', 'k_proj', 'v_proj']):
+                    factor_keys = [k for k in param_state.keys()
+                                   if isinstance(k, str) and 'factor_matrices' in k]
+                    structure_info['factor_matrix_count'] = len(factor_keys)
+                    structure_info['sample_keys'] = factor_keys[:2]
+
+                    if verbose:
+                        print(f"\nFound sample attention parameter: {param_name}")
+                        print(f"  Number of factor matrices found: {len(factor_keys)}")
+                        if factor_keys:
+                            print(f"  Sample factor matrix keys: {factor_keys[:2]}")
+                    break
+    if verbose:
+        print("="*35)
+    return structure_info
+
+
+def parse_state_key(state_key: str):
+    """State key를 파싱하여 구성 요소를 추출합니다."""
+    try:
+        if isinstance(state_key, str) and state_key.startswith('['):
+            key_parts = json.loads(state_key)
+            if (isinstance(key_parts, list) and len(key_parts) >= 4 and
+                'shampoo' in key_parts and 'factor_matrices' in key_parts):
+                block_id = key_parts[0] if 'block' in key_parts[0] else None
+                factor_idx = key_parts[-1] if isinstance(key_parts[-1], int) else None
+                return {'is_factor_matrix': True, 'block_id': block_id, 'factor_idx': factor_idx}
+    except (json.JSONDecodeError, IndexError):
+        pass
+    return {'is_factor_matrix': False}
+
+def compute_condition_number(matrix: torch.Tensor, epsilon: float = 1e-10) -> float:
+    """행렬의 condition number를 계산합니다."""
+    try:
+        matrix = matrix.detach().double()
+        if matrix.shape[0] == matrix.shape[1]:
+            matrix = matrix + torch.eye(matrix.shape[0], dtype=torch.float64, device=matrix.device) * epsilon
         
-        # 각 레이어별로 condition number 추출
-        for layer_idx in range(6):  # 6 layers
-            # Encoder layers
-            encoder_prefix = f'encoder_layers.{layer_idx}.self_attn'
-            encoder_conds = {}
+        cond_num = torch.linalg.cond(matrix).item()
+        if np.isnan(cond_num) or np.isinf(cond_num):
+            return float('inf')
+        return cond_num
+    except Exception as e:
+        print(f"  Condition number 계산 실패: {e}")
+        return float('inf')
+
+def apply_bias_correction(matrix: torch.Tensor, beta2: float, step: int) -> torch.Tensor:
+    """Bias correction을 적용합니다."""
+    if beta2 < 1.0 and step > 0:
+        bias_correction = 1.0 - (beta2 ** step)
+        if bias_correction > 1e-9: # 0으로 나누는 것을 방지
+            return matrix / bias_correction
+    return matrix
+
+def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.99):
+    """
+    지정된 디렉토리의 모든 체크포인트를 읽어
+    Shampoo Preconditioner의 Condition Number 변화 추이를 그래프로 저장합니다.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        print(f"오류: 디렉토리를 찾을 수 없습니다 -> {checkpoint_dir}")
+        return
+    
+    device = torch.device("cpu")
+    print(f"분석을 위해 {device} 장치를 사용합니다.")
+
+    # 체크포인트 파일 목록을 epoch 순서대로 정렬
+    checkpoint_files = sorted(
+        [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')],
+        key=lambda f: int(re.search(r'epoch_(\d+)', f).group(1)) if re.search(r'epoch_(\d+)', f) else -1
+    )
+        
+    if not checkpoint_files:
+        print(f"오류: '{checkpoint_dir}' 디렉토리에서 체크포인트 파일(.pth)을 찾을 수 없습니다.")
+        return
+
+    print(f"총 {len(checkpoint_files)}개의 체크포인트 파일을 분석합니다.")
+    
+    # 첫 번째 체크포인트 구조 확인
+    inspect_checkpoint_structure(os.path.join(checkpoint_dir, checkpoint_files[0]), verbose=True)
+
+    results = defaultdict(lambda: defaultdict(list))
+
+    # 각 체크포인트를 순회하며 데이터 수집
+    for filename in checkpoint_files:
+        checkpoint_path = os.path.join(checkpoint_dir, filename)
+        epoch_match = re.search(r'epoch_(\d+)', filename)
+        if not epoch_match:
+            continue
+        epoch = int(epoch_match.group(1))
+        
+        print(f"\n--- Epoch {epoch} 체크포인트 분석 중 ---")
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        except Exception as e:
+            print(f"Epoch {epoch} 체크포인트 로딩 실패: {e}")
+            continue
+
+        if 'optimizer_state_dict' not in checkpoint or 'state' not in checkpoint['optimizer_state_dict']:
+            print(f"Epoch {epoch}: optimizer state가 없습니다.")
+            continue
             
-            for proj_type in ['q_proj', 'k_proj', 'v_proj']:
-                weight_key = f'{encoder_prefix}.{proj_type}.weight'
-                if weight_key in optimizer_state['state']:
-                    state = optimizer_state['state'][weight_key]
-                    cond_info = extract_condition_from_state(state)
-                    encoder_conds[proj_type] = cond_info
+        param_states = checkpoint['optimizer_state_dict']['state']
+        
+        for param_name, param_state in param_states.items():
+            # 'encoder_layers' 또는 'decoder_layers'를 포함하고, 'attn'과 'weight'를 포함하는 파라미터만 필터링
+            match = re.search(r'(encoder_layers|decoder_layers)\.(\d+)\.(self_attn|cross_attn)\.(q_proj|k_proj|v_proj)\.weight', param_name)
+            if not match:
+                continue
+
+            layer_type, block_idx_str, attn_type, proj_type = match.groups()
+            block_idx = int(block_idx_str)
             
-            if encoder_conds:
-                results['encoder_layers'][f'layer_{layer_idx}'] = encoder_conds
-            
-            # Decoder layers
-            decoder_self_prefix = f'decoder_layers.{layer_idx}.self_attn'
-            decoder_cross_prefix = f'decoder_layers.{layer_idx}.cross_attn'
-            decoder_conds = {'self_attn': {}, 'cross_attn': {}}
-            
-            for proj_type in ['q_proj', 'k_proj', 'v_proj']:
-                # Self attention
-                weight_key = f'{decoder_self_prefix}.{proj_type}.weight'
-                if weight_key in optimizer_state['state']:
-                    state = optimizer_state['state'][weight_key]
-                    cond_info = extract_condition_from_state(state)
-                    decoder_conds['self_attn'][proj_type] = cond_info
+            proj_name = {'q_proj': 'Query', 'k_proj': 'Key', 'v_proj': 'Value'}.get(proj_type)
+
+            for state_key, state_value in param_state.items():
+                parsed = parse_state_key(state_key)
                 
-                # Cross attention
-                weight_key = f'{decoder_cross_prefix}.{proj_type}.weight'
-                if weight_key in optimizer_state['state']:
-                    state = optimizer_state['state'][weight_key]
-                    cond_info = extract_condition_from_state(state)
-                    decoder_conds['cross_attn'][proj_type] = cond_info
-            
-            if decoder_conds['self_attn'] or decoder_conds['cross_attn']:
-                results['decoder_layers'][f'layer_{layer_idx}'] = decoder_conds
-    
-    # 통계 요약
-    all_condition_numbers = []
-    for layer_type in ['encoder_layers', 'decoder_layers']:
-        for layer_name, layer_data in results[layer_type].items():
-            if layer_type == 'encoder_layers':
-                for proj_type, cond_info in layer_data.items():
-                    if 'total_condition_number' in cond_info:
-                        all_condition_numbers.append(cond_info['total_condition_number'])
-            else:  # decoder
-                for attn_type in ['self_attn', 'cross_attn']:
-                    if attn_type in layer_data:
-                        for proj_type, cond_info in layer_data[attn_type].items():
-                            if 'total_condition_number' in cond_info:
-                                all_condition_numbers.append(cond_info['total_condition_number'])
-    
-    if all_condition_numbers:
-        results['summary'] = {
-            'mean_condition_number': np.mean(all_condition_numbers),
-            'std_condition_number': np.std(all_condition_numbers),
-            'max_condition_number': np.max(all_condition_numbers),
-            'min_condition_number': np.min(all_condition_numbers),
-            'median_condition_number': np.median(all_condition_numbers)
-        }
-    
-    # 결과 저장
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    
-    # 콘솔 출력
-    print_analysis_results(results)
-    
-    return results
+                if parsed['is_factor_matrix'] and parsed['factor_idx'] is not None:
+                    factor_idx = parsed['factor_idx']
+                    
+                    if isinstance(state_value, torch.Tensor) and state_value.ndim == 2 and state_value.shape[0] == state_value.shape[1] and state_value.numel() > 1:
+                        corrected_matrix = apply_bias_correction(state_value, beta2, epoch)
+                        cond_num = compute_condition_number(corrected_matrix)
+                        
+                        factor_name = 'L' if factor_idx == 0 else 'R'
+                        key = f"{layer_type}_Block_{block_idx}_{attn_type}_{proj_name}_{factor_name}"
 
-
-def extract_condition_from_state(state):
-    """
-    Optimizer state에서 condition number 추출
-    """
-    cond_info = {}
+                        # [수정] 디버깅을 위한 로그 추가
+                        if cond_num == float('inf'):
+                            print(f"  [Debug] 무한대 조건수 발견: {key} at Epoch {epoch}")
+                        else:
+                            results[key]['epochs'].append(epoch)
+                            results[key]['cond_nums'].append(cond_num)
+                            print(f"  데이터 수집: {key}: {cond_num:.2e}")
     
-    # Shampoo의 경우 Q matrices 확인
-    if 'Q_left' in state or 'Q_right' in state:
-        # Left Q matrix
-        if 'Q_left' in state and state['Q_left'] is not None:
-            Q_left = state['Q_left']
-            try:
-                eigenvalues = torch.linalg.eigvalsh(Q_left)
-                max_eig = eigenvalues.max().item()
-                min_eig = eigenvalues[eigenvalues > 1e-10].min().item()
-                cond_left = max_eig / min_eig if min_eig > 0 else float('inf')
-                cond_info['left_preconditioner'] = {
-                    'condition_number': cond_left,
-                    'max_eigenvalue': max_eig,
-                    'min_eigenvalue': min_eig,
-                    'shape': list(Q_left.shape)
-                }
-            except Exception as e:
-                cond_info['left_preconditioner'] = f'Error: {str(e)}'
+    # (이하 그래프 그리는 부분은 동일)
+    print("\n--- 모든 체크포인트 분석 완료. 그래프 생성 중... ---")
+
+    if not results:
+        print("분석할 데이터가 없습니다. Q/K/V projection weights의 factor matrices를 찾을 수 없거나, 조건수 계산에 실패했습니다.")
+        return
+
+    # 그래프 시각화
+    for layer_type_str in ['encoder_layers', 'decoder_layers']:
+        layer_results = {k: v for k, v in results.items() if k.startswith(layer_type_str)}
+        if not layer_results:
+            continue
+
+        num_layers = max([int(re.search(r'_Block_(\d+)', key).group(1)) for key in layer_results]) + 1
+        rows, cols = -(-num_layers // 3), 3  # 올림 나눗셈
+        fig, axes = plt.subplots(rows, cols, figsize=(20, 5 * rows), squeeze=False)
+        axes = axes.flatten()
         
-        # Right Q matrix
-        if 'Q_right' in state and state['Q_right'] is not None:
-            Q_right = state['Q_right']
-            try:
-                eigenvalues = torch.linalg.eigvalsh(Q_right)
-                max_eig = eigenvalues.max().item()
-                min_eig = eigenvalues[eigenvalues > 1e-10].min().item()
-                cond_right = max_eig / min_eig if min_eig > 0 else float('inf')
-                cond_info['right_preconditioner'] = {
-                    'condition_number': cond_right,
-                    'max_eigenvalue': max_eig,
-                    'min_eigenvalue': min_eig,
-                    'shape': list(Q_right.shape)
-                }
-            except Exception as e:
-                cond_info['right_preconditioner'] = f'Error: {str(e)}'
+        color_map = {'Query': 'red', 'Key': 'green', 'Value': 'blue'}
+        marker_map = {'L': 'o', 'R': 's'}
         
-        # Total condition number
-        if 'left_preconditioner' in cond_info and 'right_preconditioner' in cond_info:
-            if isinstance(cond_info['left_preconditioner'], dict) and \
-               isinstance(cond_info['right_preconditioner'], dict):
-                total_cond = cond_info['left_preconditioner']['condition_number'] * \
-                           cond_info['right_preconditioner']['condition_number']
-                cond_info['total_condition_number'] = total_cond
-    
-    return cond_info
-
-
-def print_analysis_results(results):
-    """
-    분석 결과를 보기 좋게 출력
-    """
-    print("\n" + "="*80)
-    print("SHAMPOO PRECONDITIONER CONDITION NUMBER ANALYSIS")
-    print("="*80)
-    
-    # Encoder layers
-    print("\n--- ENCODER LAYERS ---")
-    for layer_idx in range(6):
-        layer_key = f'layer_{layer_idx}'
-        if layer_key in results['encoder_layers']:
-            print(f"\nLayer {layer_idx}:")
-            layer_data = results['encoder_layers'][layer_key]
-            for proj_type in ['q_proj', 'k_proj', 'v_proj']:
-                if proj_type in layer_data and 'total_condition_number' in layer_data[proj_type]:
-                    cond = layer_data[proj_type]['total_condition_number']
-                    print(f"  {proj_type}: {cond:.2e}")
-    
-    # Decoder layers
-    print("\n--- DECODER LAYERS ---")
-    for layer_idx in range(6):
-        layer_key = f'layer_{layer_idx}'
-        if layer_key in results['decoder_layers']:
-            print(f"\nLayer {layer_idx}:")
-            layer_data = results['decoder_layers'][layer_key]
+        for block_idx in range(num_layers):
+            ax = axes[block_idx]
+            has_data = False
             
-            # Self attention
-            if 'self_attn' in layer_data:
-                print("  Self-Attention:")
-                for proj_type in ['q_proj', 'k_proj', 'v_proj']:
-                    if proj_type in layer_data['self_attn'] and \
-                       'total_condition_number' in layer_data['self_attn'][proj_type]:
-                        cond = layer_data['self_attn'][proj_type]['total_condition_number']
-                        print(f"    {proj_type}: {cond:.2e}")
+            attn_types = ['self_attn', 'cross_attn'] if layer_type_str == 'decoder_layers' else ['self_attn']
             
-            # Cross attention
-            if 'cross_attn' in layer_data:
-                print("  Cross-Attention:")
-                for proj_type in ['q_proj', 'k_proj', 'v_proj']:
-                    if proj_type in layer_data['cross_attn'] and \
-                       'total_condition_number' in layer_data['cross_attn'][proj_type]:
-                        cond = layer_data['cross_attn'][proj_type]['total_condition_number']
-                        print(f"    {proj_type}: {cond:.2e}")
-    
-    # Summary
-    if 'summary' in results:
-        print("\n--- SUMMARY STATISTICS ---")
-        summary = results['summary']
-        print(f"Mean Condition Number: {summary['mean_condition_number']:.2e}")
-        print(f"Std Condition Number: {summary['std_condition_number']:.2e}")
-        print(f"Max Condition Number: {summary['max_condition_number']:.2e}")
-        print(f"Min Condition Number: {summary['min_condition_number']:.2e}")
-        print(f"Median Condition Number: {summary['median_condition_number']:.2e}")
-    
-    print("\n" + "="*80)
-
-
+            for attn_type in attn_types:
+                for proj_type in ['Query', 'Key', 'Value']:
+                    for factor_type in ['L', 'R']:
+                        key = f"{layer_type_str}_Block_{block_idx}_{attn_type}_{proj_type}_{factor_type}"
+                        
+                        if key in results and results[key]['epochs']:
+                            has_data = True
+                            epochs, cond_nums = results[key]['epochs'], results[key]['cond_nums']
+                            label_prefix = f"{attn_type.replace('_attn', '')} " if layer_type_str == 'decoder_layers' else ""
+                            label = f"{label_prefix}{proj_type} ({factor_type})"
+                            
+                            ax.semilogy(epochs, cond_nums, 
+                                       marker=marker_map[factor_type],
+                                       linestyle='-' if factor_type == 'L' else '--',
+                                       label=label,
+                                       color=color_map[proj_type],
+                                       linewidth=1.5,
+                                       markersize=4,
+                                       alpha=0.9)
+            
+            if has_data:
+                ax.set_title(f"Block {block_idx}", fontsize=12)
+                ax.grid(True, which="both", ls="--", alpha=0.5)
+                ax.legend(loc='best', fontsize=8)
+            else:
+                ax.set_title(f"Block {block_idx} (No Data)", fontsize=12)
+        
+        fig.supxlabel("Epoch", fontsize=14)
+        fig.supylabel("Condition Number (log scale)", fontsize=14)
+        plt.suptitle(f"Shampoo Preconditioner Condition Numbers ({layer_type_str.replace('_', ' ').title()})", 
+                     fontsize=18, fontweight='bold')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        save_path = os.path.join(os.path.dirname(checkpoint_dir), f"{layer_type_str}_condition_numbers.png")
+        plt.savefig(save_path, dpi=150)
+        print(f"\n그래프가 '{save_path}' 파일로 저장되었습니다.")
+        
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Analyze Shampoo preconditioner condition numbers')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                      help='Path to checkpoint file')
-    parser.add_argument('--output', type=str, default='condition_analysis.json',
-                      help='Output JSON file')
-    
+    parser = argparse.ArgumentParser(description='Plot Shampoo Preconditioner Condition Number trends from checkpoints.')
+    parser.add_argument('--checkpoint-dir', type=str, required=True, 
+                       help='Directory containing the .pth checkpoint files.')
+    parser.add_argument('--beta2', type=float, default=0.99,
+                       help='Beta2 value for bias correction (default: 0.99)')
     args = parser.parse_args()
     
-    results = analyze_attention_layers(args.checkpoint, args.output)
-    print(f"\nResults saved to: {args.output}")
+    plot_condition_number_trends(args.checkpoint_dir, args.beta2)
