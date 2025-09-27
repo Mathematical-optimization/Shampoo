@@ -339,32 +339,40 @@ def setup():
 def cleanup():
     dist.destroy_process_group()
 
-def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_dir, global_rank):
-    """Save checkpoint using torch.distributed.checkpoint."""
-    state_dict = {
-        'epoch': epoch,
-        'step': step,
-        'model': model.state_dict(),
-        'optimizer': optimizer.distributed_state_dict(key_to_param=model.named_parameters()),
-        'best_bleu': best_bleu
-    }
-    dist_checkpoint.save(
-        state_dict=state_dict,
-        storage_writer=dist_checkpoint.FileSystemWriter(checkpoint_dir),
-    )
-    if global_rank == 0:
-        print(f"Distributed checkpoint saved to {checkpoint_dir}")
+def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, global_rank):
+    """Save checkpoint using regular torch.save instead of distributed checkpoint."""
+    if global_rank == 0:  # rank 0에서만 저장
+        # DDP wrapper를 벗겨낸 모델 사용
+        model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+        
+        # optimizer state를 표준 형식으로 변환
+        optimizer_state = optimizer.distributed_state_dict(
+            key_to_param=dict(model.module.named_parameters())
+        )
+        
+        checkpoint = {
+            'epoch': epoch,
+            'step': step,
+            'model_state_dict': model_state,
+            'optimizer_state_dict': optimizer_state,
+            'best_bleu': best_bleu
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
 
 def save_checkpoint_for_condition_number(model, optimizer, epoch, checkpoint_path, global_rank):
     """Save checkpoint in standard format for condition-number.py analysis."""
     if global_rank == 0:
-        # Rank 0에서 전체 optimizer state를 수집하여 저장
-        optimizer_state_dict = optimizer.distributed_state_dict(key_to_param=model.named_parameters())
+        actual_model = model.module if hasattr(model, 'module') else model
         
-        # condition-number.py가 기대하는 형식으로 변환
+        optimizer_state_dict = optimizer.distributed_state_dict(
+            key_to_param=dict(actual_model.named_parameters())
+        )
+        
         checkpoint = {
             'epoch': epoch,
-            'model_state_dict': model.module.state_dict(),  # DDP unwrap
+            'model_state_dict': actual_model.state_dict(),
             'optimizer_state_dict': optimizer_state_dict,
         }
         
@@ -437,7 +445,8 @@ def main(args):
         if bleu_score > best_bleu:
             best_bleu = bleu_score
             if global_rank == 0: print(f"*** New best BLEU: {best_bleu:.2f} ***")
-            save_checkpoint(model, optimizer, epoch, global_step, best_bleu, os.path.join(args.checkpoint_dir, "best_model"), global_rank)
+            save_checkpoint(model, optimizer, epoch, global_step, best_bleu, 
+                os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"), global_rank)
             # condition-number.py를 위한 표준 체크포인트 저장
             save_checkpoint_for_condition_number(model, optimizer, epoch, os.path.join(args.checkpoint_dir, f"best_model_epoch_{epoch+1}.pth"), global_rank)
 
