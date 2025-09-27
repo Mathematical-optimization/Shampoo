@@ -43,29 +43,29 @@ def inspect_checkpoint_structure(checkpoint_path: str, verbose: bool = False):
 
             # attention weight 파라미터만 찾기 (bias 제외)
             for param_name, param_state in param_states.items():
-                if ('attn' in param_name and 
+                if ('attn' in param_name and
                     any(p in param_name for p in ['q_proj', 'k_proj', 'v_proj']) and
                     'weight' in param_name):  # weight만 처리
-                    
+
                     factor_keys = [k for k in param_state.keys()
                                    if isinstance(k, str) and 'factor_matrices' in k]
                     structure_info['attention_params'].append({
                         'name': param_name,
                         'factor_keys': factor_keys[:4] if factor_keys else []
                     })
-                    
+
                     if verbose and factor_keys:
                         print(f"\nFound attention weight parameter: {param_name}")
                         print(f"  Number of factor matrices: {len(factor_keys)}")
                         if len(factor_keys) > 0:
                             print(f"  Sample keys: {factor_keys[:2]}")
-    
+
     if verbose:
         print(f"\nTotal attention weight parameters found: {len(structure_info['attention_params'])}")
         for param_info in structure_info['attention_params'][:5]:
             print(f"  - {param_info['name']}")
         print("="*50)
-    
+
     return structure_info
 
 def parse_state_key(state_key: str):
@@ -86,12 +86,12 @@ def compute_condition_number(matrix: torch.Tensor, epsilon: float = 1e-10) -> fl
     """행렬의 condition number를 계산합니다."""
     try:
         matrix = matrix.detach().double()
-        
+
         if matrix.shape[0] != matrix.shape[1]:
             return float('inf')
-        
+
         matrix = matrix + torch.eye(matrix.shape[0], dtype=torch.float64, device=matrix.device) * epsilon
-        
+
         try:
             cond_num = torch.linalg.cond(matrix).item()
         except:
@@ -100,10 +100,10 @@ def compute_condition_number(matrix: torch.Tensor, epsilon: float = 1e-10) -> fl
                 cond_num = (S[0] / S[-1]).item() if S[-1] > epsilon else float('inf')
             except:
                 return float('inf')
-        
+
         if np.isnan(cond_num) or np.isinf(cond_num):
             return float('inf')
-        
+
         return cond_num
     except Exception as e:
         print(f"  Condition number 계산 실패: {e}")
@@ -125,7 +125,7 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
     if not os.path.isdir(checkpoint_dir):
         print(f"오류: 디렉토리를 찾을 수 없습니다 -> {checkpoint_dir}")
         return
-    
+
     device = torch.device("cpu")
     print(f"분석을 위해 {device} 장치를 사용합니다.")
 
@@ -139,19 +139,19 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
                 checkpoint_files.append((epoch, f))
             elif 'best' not in f.lower():
                 checkpoint_files.append((999, f))
-    
+
     checkpoint_files.sort(key=lambda x: x[0])
     checkpoint_files = [f for _, f in checkpoint_files]
-        
+
     if not checkpoint_files:
         print(f"오류: '{checkpoint_dir}' 디렉토리에서 체크포인트 파일(.pth)을 찾을 수 없습니다.")
         return
 
     print(f"총 {len(checkpoint_files)}개의 체크포인트 파일을 분석합니다.")
-    
+
     # 첫 번째 체크포인트 구조 확인
     structure_info = inspect_checkpoint_structure(
-        os.path.join(checkpoint_dir, checkpoint_files[0]), 
+        os.path.join(checkpoint_dir, checkpoint_files[0]),
         verbose=True
     )
 
@@ -161,14 +161,14 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
     # 각 체크포인트를 순회하며 데이터 수집
     for filename in checkpoint_files:
         checkpoint_path = os.path.join(checkpoint_dir, filename)
-        
+
         epoch_match = re.search(r'epoch[_\s]+(\d+)', filename)
         if not epoch_match:
             continue
         epoch = int(epoch_match.group(1))
-        
+
         print(f"\n--- Epoch {epoch} 체크포인트 분석 중 ({filename}) ---")
-        
+
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         except Exception as e:
@@ -178,63 +178,63 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
         if 'optimizer_state_dict' not in checkpoint or 'state' not in checkpoint['optimizer_state_dict']:
             print(f"Epoch {epoch}: optimizer state가 없습니다.")
             continue
-            
+
         param_states = checkpoint['optimizer_state_dict']['state']
         print(f"  총 파라미터 수: {len(param_states)}")
-        
+
         # 파라미터별 처리
         processed_params = set()
         for param_name, param_state in param_states.items():
             # weight 파라미터만 처리 (bias 제외)
-            if not ('attn' in param_name and 
+            if not ('attn' in param_name and
                    any(p in param_name for p in ['q_proj', 'k_proj', 'v_proj']) and
                    'weight' in param_name):
                 continue
-            
+
             # 정규표현식으로 파라미터 정보 추출
             match = re.search(r'(encoder_layers|decoder_layers)\.(\d+)\.(self_attn|cross_attn)\.(q_proj|k_proj|v_proj)\.weight', param_name)
             if not match:
                 debug_info['unmatched'] += 1
                 continue
-            
+
             layer_type = match.group(1)
             block_idx = int(match.group(2))
             attn_type = match.group(3)
             proj_type = match.group(4)
-            
+
             proj_name = {'q_proj': 'Query', 'k_proj': 'Key', 'v_proj': 'Value'}[proj_type]
-            
+
             # 이미 처리한 파라미터인지 확인
             param_key = f"{layer_type}_{block_idx}_{attn_type}_{proj_type}"
             if param_key in processed_params:
                 continue
             processed_params.add(param_key)
-            
+
             # Factor matrices 처리
             for state_key, state_value in param_state.items():
                 parsed = parse_state_key(state_key)
-                
+
                 if parsed['is_factor_matrix'] and parsed['factor_idx'] is not None:
                     factor_idx = parsed['factor_idx']
-                    
-                    if (isinstance(state_value, torch.Tensor) and 
-                        state_value.ndim == 2 and 
-                        state_value.shape[0] == state_value.shape[1] and 
+
+                    if (isinstance(state_value, torch.Tensor) and
+                        state_value.ndim == 2 and
+                        state_value.shape[0] == state_value.shape[1] and
                         state_value.numel() > 1):
-                        
+
                         corrected_matrix = apply_bias_correction(state_value, beta2, epoch)
                         cond_num = compute_condition_number(corrected_matrix)
-                        
+
                         if cond_num != float('inf'):
                             factor_name = 'L' if factor_idx == 0 else 'R'
                             key = f"{layer_type}_Block_{block_idx}_{attn_type}_{proj_name}_{factor_name}"
-                            
+
                             results[key]['epochs'].append(epoch)
                             results[key]['cond_nums'].append(cond_num)
-                            
+
                             # 각 projection type별로 출력
                             print(f"  ✓ {proj_name} {factor_name}: {key} = {cond_num:.2e}")
-    
+
     print("\n--- 모든 체크포인트 분석 완료. 그래프 생성 중... ---")
 
     if not results:
@@ -243,7 +243,7 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
 
     print(f"\n수집된 고유 키 수: {len(results)}")
     print(f"총 데이터 포인트 수: {sum(len(v['epochs']) for v in results.values())}")
-    
+
     # 수집된 데이터 요약 출력
     print("\n=== 수집된 데이터 요약 ===")
     for layer_type in ['encoder_layers', 'decoder_layers']:
@@ -258,7 +258,7 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
                         proj_keys = [k for k in block_keys if proj in k]
                         if proj_keys:
                             print(f"    {proj}: {len(proj_keys)} factors")
-    
+
     # 그래프 시각화
     for layer_type_str in ['encoder_layers', 'decoder_layers']:
         layer_results = {k: v for k, v in results.items() if k.startswith(layer_type_str)}
@@ -267,32 +267,32 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
 
         num_layers = 4  # 4개 레이어로 고정
         rows, cols = 2, 2  # 2x2 그리드
-        
+
         fig, axes = plt.subplots(rows, cols, figsize=(16, 12), squeeze=False)
         axes = axes.flatten()
-        
+
         color_map = {'Query': 'red', 'Key': 'green', 'Value': 'blue'}
         marker_map = {'L': 'o', 'R': 's'}
-        
+
         for block_idx in range(num_layers):
             ax = axes[block_idx]
             has_data = False
-            
+
             attn_types = ['self_attn', 'cross_attn'] if layer_type_str == 'decoder_layers' else ['self_attn']
-            
+
             for attn_type in attn_types:
                 for proj_type in ['Query', 'Key', 'Value']:
                     for factor_type in ['L', 'R']:
                         key = f"{layer_type_str}_Block_{block_idx}_{attn_type}_{proj_type}_{factor_type}"
-                        
+
                         if key in results and results[key]['epochs']:
                             has_data = True
                             epochs, cond_nums = results[key]['epochs'], results[key]['cond_nums']
-                            
+
                             label_prefix = f"{attn_type.replace('_attn', '')} " if layer_type_str == 'decoder_layers' else ""
                             label = f"{label_prefix}{proj_type} ({factor_type})"
-                            
-                            ax.semilogy(epochs, cond_nums, 
+
+                            ax.semilogy(epochs, cond_nums,
                                        marker=marker_map[factor_type],
                                        linestyle='-' if factor_type == 'L' else '--',
                                        label=label,
@@ -300,7 +300,7 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
                                        linewidth=1.5,
                                        markersize=5,
                                        alpha=0.8)
-            
+
             if has_data:
                 ax.set_title(f"Layer {block_idx}", fontsize=12, fontweight='bold')
                 ax.grid(True, which="both", ls="--", alpha=0.3)
@@ -309,13 +309,13 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
                 ax.set_ylabel("Condition Number (log scale)")
             else:
                 ax.set_title(f"Layer {block_idx} (No Data)", fontsize=12, color='gray')
-                ax.text(0.5, 0.5, 'No Data Available', ha='center', va='center', 
+                ax.text(0.5, 0.5, 'No Data Available', ha='center', va='center',
                        transform=ax.transAxes, fontsize=10, color='gray')
-        
-        fig.suptitle(f"Shampoo Preconditioner Condition Numbers ({layer_type_str.replace('_', ' ').title()})", 
+
+        fig.suptitle(f"Shampoo Preconditioner Condition Numbers ({layer_type_str.replace('_', ' ').title()})",
                      fontsize=16, fontweight='bold')
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        
+
         save_path = os.path.join(os.path.dirname(checkpoint_dir), f"{layer_type_str}_condition_numbers.png")
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"\n그래프가 '{save_path}' 파일로 저장되었습니다.")
@@ -323,14 +323,14 @@ def plot_condition_number_trends(checkpoint_dir: str, beta2: float = 0.98):
 
 def main():
     parser = argparse.ArgumentParser(description='Plot Shampoo Preconditioner Condition Number trends from checkpoints.')
-    parser.add_argument('--checkpoint-dir', type=str, required=True, 
+    parser.add_argument('--checkpoint-dir', type=str, required=True,
                        help='Directory containing the .pth checkpoint files.')
     parser.add_argument('--beta2', type=float, default=0.98,
                        help='Beta2 value for bias correction (default: 0.98)')
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug mode for verbose output')
     args = parser.parse_args()
-    
+
     plot_condition_number_trends(args.checkpoint_dir, args.beta2)
 
 if __name__ == '__main__':
