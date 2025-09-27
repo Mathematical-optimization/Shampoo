@@ -1,4 +1,4 @@
-# condition-number.py (최종 수정본)
+# condition-number.py (최종 수정 버전)
 import torch
 import torch.nn as nn
 import argparse
@@ -9,112 +9,6 @@ from collections import defaultdict
 import numpy as np
 import json
 from typing import Dict, List, Tuple, Any, Optional
-
-def inspect_checkpoint_structure(checkpoint_path: str, verbose: bool = False) -> Optional[Dict]:
-    """체크포인트 구조를 확인하고 디버깅 정보를 출력합니다."""
-    print("\n=== Checkpoint Structure Inspection ===")
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        print(f"Successfully loaded checkpoint: {checkpoint_path}")
-    except Exception as e:
-        print(f"Error loading checkpoint: {e}")
-        return None
-
-    # 최상위 키 확인
-    if verbose:
-        print(f"Top-level keys: {list(checkpoint.keys())}")
-    
-    # Shampoo 설정 정보 확인
-    if 'shampoo_config' in checkpoint:
-        print(f"Shampoo config found: {checkpoint['shampoo_config']}")
-        beta2 = checkpoint['shampoo_config'].get('beta2', 0.98)
-    else:
-        beta2 = 0.98  # 기본값
-        print(f"No shampoo_config found, using default beta2={beta2}")
-
-    structure_info = {
-        'has_optimizer_state': False,
-        'has_state_dict': False,
-        'param_count': 0,
-        'factor_matrix_count': 0,
-        'sample_keys': [],
-        'attention_params': [],
-        'beta2': beta2
-    }
-
-    if 'optimizer_state_dict' not in checkpoint:
-        print("No optimizer_state_dict found in checkpoint")
-        return structure_info
-
-    structure_info['has_optimizer_state'] = True
-    opt_state = checkpoint['optimizer_state_dict']
-
-    # state 키 확인
-    if 'state' in opt_state:
-        structure_info['has_state_dict'] = True
-        param_states = opt_state['state']
-        structure_info['param_count'] = len(param_states)
-        
-        print(f"Total parameters in optimizer state: {len(param_states)}")
-
-        # Attention 파라미터 찾기
-        attention_count = 0
-        for param_name, param_state in param_states.items():
-            # self_attn 또는 cross_attn 패턴 확인
-            if ('self_attn' in param_name or 'cross_attn' in param_name):
-                # q_proj, k_proj, v_proj weight 파라미터만 처리
-                if any(p in param_name for p in ['q_proj', 'k_proj', 'v_proj']) and 'weight' in param_name:
-                    
-                    # Factor matrices 찾기
-                    factor_keys = []
-                    for key in param_state.keys():
-                        if isinstance(key, str):
-                            try:
-                                # JSON 형식 키 파싱
-                                if key.startswith('[') and key.endswith(']'):
-                                    key_parts = json.loads(key)
-                                    if ('shampoo' in key_parts and 'factor_matrices' in key_parts):
-                                        factor_keys.append(key)
-                            except:
-                                pass
-                    
-                    if factor_keys:
-                        attention_count += 1
-                        structure_info['attention_params'].append({
-                            'name': param_name,
-                            'factor_keys': factor_keys[:4]  # 샘플로 처음 4개만
-                        })
-                        
-                        if verbose:
-                            print(f"\nFound attention parameter #{attention_count}: {param_name}")
-                            print(f"  Number of factor matrices: {len(factor_keys)}")
-
-    print(f"Total attention parameters found: {len(structure_info['attention_params'])}")
-    
-    if verbose and structure_info['attention_params']:
-        print("\nSample attention parameters:")
-        for param_info in structure_info['attention_params'][:3]:
-            print(f"  - {param_info['name']}")
-    
-    print("="*50)
-    return structure_info
-
-def parse_state_key(state_key: str) -> Dict:
-    """State key를 파싱하여 구성 요소를 추출합니다."""
-    try:
-        if isinstance(state_key, str) and state_key.startswith('['):
-            key_parts = json.loads(state_key)
-            if isinstance(key_parts, list) and len(key_parts) >= 4:
-                if 'shampoo' in key_parts and 'factor_matrices' in key_parts:
-                    # 마지막 요소가 factor index
-                    factor_idx = key_parts[-1] if isinstance(key_parts[-1], int) else None
-                    return {
-                        'is_factor_matrix': True,
-                        'factor_idx': factor_idx
-                    }
-    except:
-        pass
-    return {'is_factor_matrix': False}
 
 def compute_condition_number(matrix: torch.Tensor, epsilon: float = 1e-10) -> float:
     """행렬의 condition number를 계산합니다."""
@@ -171,14 +65,8 @@ def plot_condition_number_trends(checkpoint_dir: str, output_dir: str = None):
     checkpoint_files = []
     for f in os.listdir(checkpoint_dir):
         if f.endswith('.pth'):
-            # condition_epoch_N.pth 패턴 우선
-            if 'condition_epoch' in f:
-                match = re.search(r'condition_epoch_(\d+)', f)
-                if match:
-                    epoch = int(match.group(1))
-                    checkpoint_files.append((epoch, f))
-            elif 'checkpoint_epoch' in f:
-                match = re.search(r'checkpoint_epoch_(\d+)', f)
+            if 'condition_epoch' in f or 'checkpoint_epoch' in f:
+                match = re.search(r'epoch_(\d+)', f)
                 if match:
                     epoch = int(match.group(1))
                     checkpoint_files.append((epoch, f))
@@ -189,18 +77,7 @@ def plot_condition_number_trends(checkpoint_dir: str, output_dir: str = None):
         print(f"오류: '{checkpoint_dir}' 디렉토리에서 체크포인트 파일을 찾을 수 없습니다.")
         return
     
-    print(f"총 {len(checkpoint_files)}개의 체크포인트 파일을 분석합니다.")
-    
-    # 첫 번째 체크포인트 구조 확인
-    first_path = os.path.join(checkpoint_dir, checkpoint_files[0][1])
-    structure_info = inspect_checkpoint_structure(first_path, verbose=True)
-    
-    if not structure_info or not structure_info['attention_params']:
-        print("Attention 파라미터를 찾을 수 없습니다.")
-        return
-    
-    beta2 = structure_info.get('beta2', 0.98)
-    print(f"Using beta2={beta2} for bias correction")
+    print(f"총 {len(checkpoint_files)}개의 체크포인트 파일을 분석합니다.\n")
     
     # 결과 저장용 딕셔너리
     results = defaultdict(lambda: {'epochs': [], 'cond_nums': []})
@@ -208,93 +85,123 @@ def plot_condition_number_trends(checkpoint_dir: str, output_dir: str = None):
     # 각 체크포인트 분석
     for epoch, filename in checkpoint_files:
         checkpoint_path = os.path.join(checkpoint_dir, filename)
-        print(f"\n--- Epoch {epoch} 체크포인트 분석 중 ({filename}) ---")
+        print(f"--- Epoch {epoch} 체크포인트 분석 중 ({filename}) ---")
         
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         except Exception as e:
-            print(f"Epoch {epoch} 체크포인트 로딩 실패: {e}")
+            print(f"체크포인트 로딩 실패: {e}")
             continue
         
-        if 'optimizer_state_dict' not in checkpoint or 'state' not in checkpoint['optimizer_state_dict']:
-            print(f"Epoch {epoch}: optimizer state가 없습니다.")
+        if 'optimizer_state_dict' not in checkpoint:
+            print(f"optimizer_state_dict가 없습니다.")
             continue
+            
+        param_states = checkpoint['optimizer_state_dict'].get('state', {})
         
-        param_states = checkpoint['optimizer_state_dict']['state']
-        analyzed_params = 0
+        # beta2 가져오기
+        beta2 = 0.99
+        if 'shampoo_config' in checkpoint:
+            beta2 = checkpoint['shampoo_config'].get('beta2', 0.99)
+        print(f"  Using beta2={beta2}")
+        
+        analyzed_count = 0
+        encoder_count = 0
+        decoder_count = 0
         
         # 각 파라미터 처리
         for param_name, param_state in param_states.items():
-            # Attention weight만 처리
+            # Attention 파라미터만 처리
             if not (('self_attn' in param_name or 'cross_attn' in param_name) and 
                    any(p in param_name for p in ['q_proj', 'k_proj', 'v_proj']) and 
                    'weight' in param_name):
                 continue
             
-            # 파라미터 정보 추출
+            # 파라미터 정보 파싱
             match = re.search(
-                r'(encoder_layers|decoder_layers)\.(\d+)\.(self_attn|cross_attn)\.(q_proj|k_proj|v_proj)\.weight',
+                r'(encoder_layers|decoder_layers)\.(\d+)\.(self_attn|cross_attn)\.(q_proj|k_proj|v_proj)',
                 param_name
             )
             if not match:
                 continue
-            
+                
             layer_type = match.group(1)
-            block_idx = int(match.group(2))
+            layer_idx = int(match.group(2))
             attn_type = match.group(3)
             proj_type = match.group(4)
             
             proj_name = {'q_proj': 'Query', 'k_proj': 'Key', 'v_proj': 'Value'}[proj_type]
             
-            # Factor matrices 처리
-            factor_count = 0
-            for state_key, state_value in param_state.items():
-                parsed = parse_state_key(state_key)
-                
-                if parsed['is_factor_matrix'] and parsed['factor_idx'] is not None:
-                    factor_idx = parsed['factor_idx']
-                    
-                    if (isinstance(state_value, torch.Tensor) and 
-                        state_value.ndim == 2 and 
-                        state_value.shape[0] == state_value.shape[1] and 
-                        state_value.shape[0] > 1):
-                        
-                        # Bias correction 적용
-                        corrected_matrix = apply_bias_correction(state_value, beta2, epoch)
-                        cond_num = compute_condition_number(corrected_matrix)
-                        
-                        if cond_num != float('inf'):
-                            factor_name = 'L' if factor_idx == 0 else 'R'
-                            key = f"{layer_type}_Block{block_idx}_{attn_type}_{proj_name}_{factor_name}"
+            # JSON 형식 키에서 factor matrices 찾기
+            factor_matrices_found = False
+            for key, value in param_state.items():
+                if isinstance(key, str) and key.startswith('['):
+                    try:
+                        key_parts = json.loads(key)
+                        # ["block_0", "shampoo", "factor_matrices", 0/1] 형태 확인
+                        if (isinstance(key_parts, list) and len(key_parts) == 4 and
+                            key_parts[1] == 'shampoo' and 
+                            key_parts[2] == 'factor_matrices' and
+                            isinstance(key_parts[3], int)):
                             
-                            results[key]['epochs'].append(epoch)
-                            results[key]['cond_nums'].append(cond_num)
-                            factor_count += 1
+                            factor_idx = key_parts[3]  # 0 = L, 1 = R
+                            
+                            if isinstance(value, torch.Tensor):
+                                if value.shape[0] == value.shape[1] and value.shape[0] > 1:
+                                    # Bias correction 적용
+                                    corrected_matrix = apply_bias_correction(value, beta2, epoch)
+                                    cond_num = compute_condition_number(corrected_matrix)
+                                    
+                                    if cond_num != float('inf'):
+                                        factor_name = 'L' if factor_idx == 0 else 'R'
+                                        result_key = f"{layer_type}_Block{layer_idx}_{attn_type}_{proj_name}_{factor_name}"
+                                        results[result_key]['epochs'].append(epoch)
+                                        results[result_key]['cond_nums'].append(cond_num)
+                                        factor_matrices_found = True
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        continue
             
-            if factor_count > 0:
-                analyzed_params += 1
+            if factor_matrices_found:
+                analyzed_count += 1
+                if layer_type == 'encoder_layers':
+                    encoder_count += 1
+                else:
+                    decoder_count += 1
         
-        print(f"  분석된 attention 파라미터 수: {analyzed_params}")
+        print(f"  분석된 attention 파라미터: {analyzed_count} (Encoder: {encoder_count}, Decoder: {decoder_count})")
+    
+    print(f"\n수집된 고유 키 수: {len(results)}")
+    print(f"총 데이터 포인트 수: {sum(len(v['epochs']) for v in results.values())}")
     
     if not results:
         print("경고: 분석할 데이터가 없습니다.")
         return
     
-    print(f"\n수집된 고유 키 수: {len(results)}")
-    print(f"총 데이터 포인트 수: {sum(len(v['epochs']) for v in results.values())}")
+    # Encoder와 Decoder 키 분리
+    encoder_keys = sorted([k for k in results.keys() if 'encoder_layers' in k])
+    decoder_keys = sorted([k for k in results.keys() if 'decoder_layers' in k])
+    
+    print(f"Encoder 키 수: {len(encoder_keys)}")
+    print(f"Decoder 키 수: {len(decoder_keys)}")
+    
+    # 샘플 키 출력
+    if encoder_keys:
+        print("Encoder 샘플 키:", encoder_keys[:3])
+    if decoder_keys:
+        print("Decoder 샘플 키:", decoder_keys[:3])
     
     # 그래프 생성
-    for layer_type_str in ['encoder_layers', 'decoder_layers']:
-        layer_results = {k: v for k, v in results.items() if k.startswith(layer_type_str)}
-        if not layer_results:
+    for layer_type_str, layer_keys in [('encoder_layers', encoder_keys), ('decoder_layers', decoder_keys)]:
+        if not layer_keys:
+            print(f"\n{layer_type_str}에 대한 데이터가 없습니다.")
             continue
         
-        # 블록 수 자동 감지
+        # 블록 수 감지
         max_block = max([int(re.search(r'Block(\d+)', k).group(1)) 
-                        for k in layer_results.keys()]) + 1
+                        for k in layer_keys]) + 1
         
         # 그리드 크기 결정
-        rows = (max_block + 1) // 2
+        rows = max(2, (max_block + 1) // 2)
         cols = 2
         
         fig, axes = plt.subplots(rows, cols, figsize=(16, 4*rows), squeeze=False)
@@ -365,9 +272,9 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, required=True,
                        help='Directory containing the .pth checkpoint files.')
     parser.add_argument('--output-dir', type=str, default=None,
-                       help='Directory to save output plots (default: parent of checkpoint-dir)')
+                       help='Directory to save output plots')
     parser.add_argument('--debug', action='store_true',
-                       help='Enable debug mode for verbose output')
+                       help='Enable debug mode')
     
     args = parser.parse_args()
     
