@@ -388,13 +388,14 @@ def log_condition_numbers(optimizer, writer, global_step):
     except Exception as e:
         print(f"Warning: Failed to log condition numbers: {e}")
 
-# [수정] 모든 GPU의 옵티마이저 상태를 수집하는 함수
+# Transformer.py 파일에 있는 기존 함수를 삭제하고 아래 코드로 교체하세요.
+
 def gather_optimizer_state_from_all_ranks(optimizer, model, world_size):
     """
     모든 랭크에서 옵티마이저 상태를 수집하고 통합합니다.
+    Distributed Shampoo의 분산된 factor matrices를 올바르게 처리합니다.
     """
     # 각 GPU에서 로컬 옵티마이저 상태를 가져옵니다.
-    # [수정] dict()로 감싸지 않고 이터레이터 자체를 전달합니다.
     local_state = optimizer.distributed_state_dict(
         key_to_param=model.module.named_parameters()
     )
@@ -421,10 +422,32 @@ def gather_optimizer_state_from_all_ranks(optimizer, model, world_size):
         # 각 파라미터에 대해 모든 GPU의 상태를 병합합니다.
         for param_key in all_param_keys:
             merged_state['state'][param_key] = {}
+            
+            # 해당 파라미터에 대한 모든 상태 키를 모든 랭크에서 수집합니다.
+            all_state_keys = set()
             for state in all_states:
                 if state and 'state' in state and param_key in state['state']:
-                    merged_state['state'][param_key].update(state['state'][param_key])
+                    all_state_keys.update(state['state'][param_key].keys())
+
+            # 각 상태 키에 대해 값을 병합합니다.
+            for state_key in all_state_keys:
+                # 랭크를 순회하며 해당 상태 키에 대한 값을 찾습니다.
+                # 분산된 텐서(예: factor_matrices)는 하나의 랭크에만 존재할 수 있으므로,
+                # 찾은 첫 번째 유효한 값을 사용합니다.
+                for state in all_states:
+                    if state and 'state' in state and param_key in state['state'] and state_key in state['state'][param_key]:
+                        value = state['state'][param_key][state_key]
+                        # 텐서인 경우, 빈 텐서가 아닌 유효한 값을 찾으면 병합하고 루프를 중단합니다.
+                        if isinstance(value, torch.Tensor):
+                            if value.numel() > 0:
+                                merged_state['state'][param_key][state_key] = value
+                                break
+                        # 텐서가 아닌 경우(예: 스텝 카운터), 값을 병합하고 루프를 중단합니다.
+                        else:
+                            merged_state['state'][param_key][state_key] = value
+                            break
         return merged_state
+        
     return None
 
 
