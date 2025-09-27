@@ -348,7 +348,7 @@ def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_dir, gl
         'optimizer': optimizer.distributed_state_dict(key_to_param=model.named_parameters()),
         'best_bleu': best_bleu
     }
-    dist_checkpoint.save_state_dict(
+    dist_checkpoint.save(
         state_dict=state_dict,
         storage_writer=dist_checkpoint.FileSystemWriter(checkpoint_dir),
     )
