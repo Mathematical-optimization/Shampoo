@@ -1,11 +1,12 @@
-# transformer_algoperf.py (최종 수정본)
+# transformer_algoperf.py (최종 수정본 - 완전판)
 
 import os
 import math
 import argparse
 import functools
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import time
+import json
 
 import torch
 import torch.nn as nn
@@ -15,7 +16,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-import torch.distributed.checkpoint as dist_checkpoint
 
 # Hugging Face 라이브러리
 from datasets import load_dataset
@@ -46,14 +46,13 @@ class PositionalEncoding(nn.Module):
                            (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        # 완전히 새로운 텐서로 만들기
-        pe = pe.unsqueeze(0).transpose(0, 1).clone().detach()
-        self.register_buffer('pe', pe)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        # persistent=False로 설정하여 DDP에서 broadcast되지 않도록 함
+        self.register_buffer('pe', pe, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [seq_len, batch_size, d_model]"""
-        # pe도 clone하여 사용
-        return x + self.pe[:x.size(0)].clone()
+        return x + self.pe[:x.size(0)]
 
 
 class CustomMultiheadAttention(nn.Module):
@@ -142,7 +141,6 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.pad_idx = pad_idx
         self.shared_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
-        # Encoder와 Decoder용 별도의 PositionalEncoding 생성
         self.encoder_pos_encoding = PositionalEncoding(d_model, max_seq_len)
         self.decoder_pos_encoding = PositionalEncoding(d_model, max_seq_len)
         self.encoder_layers = nn.ModuleList([
@@ -171,7 +169,7 @@ class Transformer(nn.Module):
     def encode(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.shared_embedding(src) * math.sqrt(self.d_model)
         x = x.transpose(0, 1)
-        x = self.encoder_pos_encoding(x)  # encoder용 사용
+        x = self.encoder_pos_encoding(x)
         x = self.dropout(x)
         for layer in self.encoder_layers:
             x = layer(x, src_mask)
@@ -182,7 +180,7 @@ class Transformer(nn.Module):
                src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.shared_embedding(tgt) * math.sqrt(self.d_model)
         x = x.transpose(0, 1)
-        x = self.decoder_pos_encoding(x)  # decoder용 사용
+        x = self.decoder_pos_encoding(x)
         x = self.dropout(x)
         for layer in self.decoder_layers:
             x = layer(x, encoder_output, tgt_mask, src_mask)
@@ -198,6 +196,7 @@ class Transformer(nn.Module):
         decoder_output = self.decode(tgt, encoder_output, tgt_mask, src_mask)
         return F.linear(decoder_output.transpose(0, 1), self.shared_embedding.weight)
 
+
 # ============= 데이터 처리 =============
 
 class WMT17Dataset(Dataset):
@@ -212,13 +211,17 @@ class WMT17Dataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]['translation']
         src_text, tgt_text = item['de'], item['en']
-        src_encoding = self.tokenizer(src_text, max_length=self.max_seq_len, padding='max_length', truncation=True, return_tensors='pt')
-        tgt_encoding = self.tokenizer(tgt_text, max_length=self.max_seq_len, padding='max_length', truncation=True, return_tensors='pt')
-        return {'src': src_encoding['input_ids'].squeeze(0), 'tgt': tgt_encoding['input_ids'].squeeze(0), 'src_text': src_text, 'tgt_text': tgt_text}
+        src_encoding = self.tokenizer(src_text, max_length=self.max_seq_len, padding='max_length', 
+                                     truncation=True, return_tensors='pt')
+        tgt_encoding = self.tokenizer(tgt_text, max_length=self.max_seq_len, padding='max_length', 
+                                     truncation=True, return_tensors='pt')
+        return {'src': src_encoding['input_ids'].squeeze(0), 'tgt': tgt_encoding['input_ids'].squeeze(0), 
+                'src_text': src_text, 'tgt_text': tgt_text}
 
 
 def create_data_loaders(args, tokenizer, global_rank, world_size):
-    if global_rank == 0: print("Loading WMT datasets...")
+    if global_rank == 0: 
+        print("Loading WMT datasets...")
     dataset = load_dataset("wmt17", "de-en", cache_dir=args.data_path)
     val_dataset_raw = load_dataset("wmt14", "de-en", cache_dir=args.data_path)
     train_data = dataset['train']
@@ -226,11 +229,14 @@ def create_data_loaders(args, tokenizer, global_rank, world_size):
         train_data = train_data.select(range(min(args.max_train_samples, len(train_data))))
     train_dataset = WMT17Dataset(train_data, tokenizer, args.max_seq_len)
     val_dataset = WMT17Dataset(val_dataset_raw['validation'], tokenizer, args.max_seq_len)
-    if global_rank == 0: print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(val_dataset)}")
+    if global_rank == 0: 
+        print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(val_dataset)}")
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=args.workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=args.workers, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, 
+                            num_workers=args.workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, 
+                          num_workers=args.workers, pin_memory=True)
     return train_loader, val_loader
 
 
@@ -239,20 +245,21 @@ def create_data_loaders(args, tokenizer, global_rank, world_size):
 def label_smoothed_cross_entropy(logits, targets, epsilon=0.1, ignore_index=-100):
     vocab_size = logits.size(-1)
     log_probs = F.log_softmax(logits, dim=-1)
-    smooth_target = torch.full_like(log_probs, epsilon / (vocab_size - 1)) # -1 for ignore_index
+    smooth_target = torch.full_like(log_probs, epsilon / (vocab_size - 1))
     smooth_target.scatter_(-1, targets.unsqueeze(-1), 1.0 - epsilon)
     mask = targets != ignore_index
     smooth_target.masked_fill_(~mask.unsqueeze(-1), 0)
     loss = -(smooth_target * log_probs).sum(dim=-1)
     return loss.masked_select(mask).mean()
 
-
-def train_epoch(model, dataloader, optimizer, device, args, global_step):
+def train_epoch(model, dataloader, optimizer, device, args, global_step, writer, global_rank):
+    """Training epoch with warning fixes"""
     model.train()
     total_loss, total_tokens = 0, 0
-    progress_bar = tqdm(dataloader, desc=f"Epoch {args.current_epoch+1} Training", disable=(dist.get_rank() != 0))
+    progress_bar = tqdm(dataloader, desc=f"Epoch {args.current_epoch+1} Training", 
+                       disable=(dist.get_rank() != 0))
 
-    for batch in progress_bar:
+    for batch_idx, batch in enumerate(progress_bar):
         global_step += 1
         lr = get_lr_schedule(global_step, args.warmup_steps, args.d_model)
         for param_group in optimizer.param_groups:
@@ -263,35 +270,56 @@ def train_epoch(model, dataloader, optimizer, device, args, global_step):
 
         optimizer.zero_grad(set_to_none=True)
         output = model(src, tgt_input)
-        loss = label_smoothed_cross_entropy(output.reshape(-1, output.size(-1)), tgt_output.reshape(-1), epsilon=args.label_smoothing, ignore_index=tokenizer.pad_token_id)
+        loss = label_smoothed_cross_entropy(
+            output.reshape(-1, output.size(-1)), 
+            tgt_output.reshape(-1), 
+            epsilon=args.label_smoothing, 
+            ignore_index=tokenizer.pad_token_id
+        )
         loss.backward()
+        
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
         optimizer.step()
 
-        num_tokens = (tgt_output != tokenizer.pad_token_id).sum().item()
-        total_loss += loss.item() * num_tokens
-        total_tokens += num_tokens
+        # 수정: detach()를 사용하여 gradient 추적 제거
+        with torch.no_grad():
+            num_tokens = (tgt_output != tokenizer.pad_token_id).sum().item()
+            loss_value = loss.item()  # loss는 이미 backward() 후이므로 detach() 대신 no_grad 사용
+            total_loss += loss_value * num_tokens
+            total_tokens += num_tokens
+        
+        # 실시간 condition number 로깅
+        if global_rank == 0 and batch_idx % args.log_condition_interval == 0:
+            log_condition_numbers(optimizer, writer, global_step)
+        
         if dist.get_rank() == 0:
-            progress_bar.set_postfix({'loss': loss.item(), 'lr': lr})
+            progress_bar.set_postfix({'loss': loss_value, 'lr': lr})
 
     return total_loss / total_tokens if total_tokens > 0 else 0, global_step
 
 
 def evaluate(model, dataloader, device, tokenizer):
+    """Evaluation with consistent handling"""
     model.eval()
     total_loss, total_tokens = 0, 0
-    with torch.no_grad():
+    with torch.no_grad():  # 이미 no_grad 컨텍스트 안에 있음
         for batch in tqdm(dataloader, desc="Evaluating", disable=(dist.get_rank() != 0)):
             src, tgt = batch['src'].to(device), batch['tgt'].to(device)
             tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
             output = model(src, tgt_input)
-            loss = F.cross_entropy(output.reshape(-1, output.size(-1)), tgt_output.reshape(-1), ignore_index=tokenizer.pad_token_id)
+            loss = F.cross_entropy(
+                output.reshape(-1, output.size(-1)), 
+                tgt_output.reshape(-1), 
+                ignore_index=tokenizer.pad_token_id
+            )
+            
             num_tokens = (tgt_output != tokenizer.pad_token_id).sum().item()
-            total_loss += loss.item() * num_tokens
+            loss_value = loss.item()  # no_grad 컨텍스트 내에서는 안전
+            total_loss += loss_value * num_tokens
             total_tokens += num_tokens
+            
     return total_loss / total_tokens if total_tokens > 0 else 0
-
 
 def greedy_decode(model, src, max_len, device, tokenizer):
     model.eval()
@@ -308,7 +336,8 @@ def greedy_decode(model, src, max_len, device, tokenizer):
             logits = F.linear(decoder_output[-1, :, :], model.module.shared_embedding.weight)
             next_token = logits.argmax(dim=-1, keepdim=True)
             tgt = torch.cat([tgt, next_token], dim=1)
-            if (next_token == tokenizer.sep_token_id).all(): break
+            if (next_token == tokenizer.sep_token_id).all(): 
+                break
     return tgt
 
 
@@ -320,7 +349,8 @@ def compute_bleu(model, dataloader, device, tokenizer, max_decode_len):
             src, tgt_texts = batch['src'].to(device), batch['tgt_text']
             translations = greedy_decode(model, src, max_decode_len, device, tokenizer)
             for i in range(translations.size(0)):
-                hyp_ids = [tid for tid in translations[i].cpu().tolist() if tid not in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]]
+                hyp_ids = [tid for tid in translations[i].cpu().tolist() 
+                          if tid not in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]]
                 hypotheses.append(tokenizer.decode(hyp_ids))
                 references.append(tgt_texts[i])
     return sacrebleu.corpus_bleu(hypotheses, [references]).score if hypotheses else 0.0
@@ -330,54 +360,78 @@ def get_lr_schedule(step, warmup_steps, d_model):
     step = max(1, step)
     return (d_model ** -0.5) * min(step ** -0.5, step * warmup_steps ** -1.5)
 
+
+def log_condition_numbers(optimizer, writer, global_step):
+    """Log condition numbers of Shampoo preconditioners to TensorBoard."""
+    try:
+        if hasattr(optimizer, '_per_group_state_lists'):
+            for group_idx, state_lists in enumerate(optimizer._per_group_state_lists):
+                if 'SHAMPOO_PRECONDITIONER_LIST' in state_lists:
+                    preconditioner_list = state_lists['SHAMPOO_PRECONDITIONER_LIST']
+                    
+                    # 각 Kronecker factor의 condition number 계산
+                    for block_idx, kronecker_factors in enumerate(
+                        preconditioner_list._masked_kronecker_factors_list[:10]  # 처음 10개만 로깅
+                    ):
+                        for factor_idx, factor_matrix in enumerate(kronecker_factors.factor_matrices):
+                            if factor_matrix.shape[0] == factor_matrix.shape[1] and factor_matrix.shape[0] > 1:
+                                try:
+                                    cond_num = torch.linalg.cond(factor_matrix.double()).item()
+                                    if not math.isnan(cond_num) and not math.isinf(cond_num):
+                                        writer.add_scalar(
+                                            f'ConditionNumber/Group{group_idx}/Block{block_idx}/Factor{factor_idx}',
+                                            cond_num,
+                                            global_step
+                                        )
+                                except Exception:
+                                    pass  # 계산 실패시 무시
+    except Exception as e:
+        print(f"Warning: Failed to log condition numbers: {e}")
+
+
+def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, global_rank, args):
+    """Save checkpoint with both standard format and Shampoo metadata."""
+    if global_rank == 0:
+        actual_model = model.module if hasattr(model, 'module') else model
+        
+        # Optimizer state를 표준 형식으로 변환
+        optimizer_state = optimizer.distributed_state_dict(
+            key_to_param=dict(actual_model.named_parameters())
+        )
+        
+        # Shampoo 설정 메타데이터
+        shampoo_config = {
+            'beta2': args.beta2,
+            'epsilon': 1e-8,
+            'max_preconditioner_dim': args.max_preconditioner_dim,
+            'precondition_frequency': args.precondition_frequency,
+            'start_preconditioning_step': args.start_preconditioning_step,
+        }
+        
+        checkpoint = {
+            'epoch': epoch,
+            'step': step,
+            'model_state_dict': actual_model.state_dict(),
+            'optimizer_state_dict': optimizer_state,
+            'best_bleu': best_bleu,
+            'shampoo_config': shampoo_config,
+            'args': vars(args),  # 모든 args 저장
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+
+
 def setup():
     dist.init_process_group(backend="nccl", init_method="env://")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
 
+
 def cleanup():
     dist.destroy_process_group()
 
-def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, global_rank):
-    """Save checkpoint using regular torch.save instead of distributed checkpoint."""
-    if global_rank == 0:  # rank 0에서만 저장
-        # DDP wrapper를 벗겨낸 모델 사용
-        model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-        
-        # optimizer state를 표준 형식으로 변환
-        optimizer_state = optimizer.distributed_state_dict(
-            key_to_param=dict(model.module.named_parameters())
-        )
-        
-        checkpoint = {
-            'epoch': epoch,
-            'step': step,
-            'model_state_dict': model_state,
-            'optimizer_state_dict': optimizer_state,
-            'best_bleu': best_bleu
-        }
-        
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved to {checkpoint_path}")
-
-def save_checkpoint_for_condition_number(model, optimizer, epoch, checkpoint_path, global_rank):
-    """Save checkpoint in standard format for condition-number.py analysis."""
-    if global_rank == 0:
-        actual_model = model.module if hasattr(model, 'module') else model
-        
-        optimizer_state_dict = optimizer.distributed_state_dict(
-            key_to_param=dict(actual_model.named_parameters())
-        )
-        
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': actual_model.state_dict(),
-            'optimizer_state_dict': optimizer_state_dict,
-        }
-        
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Standard checkpoint saved to {checkpoint_path} for condition number analysis")
 
 def main(args):
     local_rank = setup()
@@ -389,7 +443,7 @@ def main(args):
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir) if global_rank == 0 else None
 
-    global tokenizer  # global로 선언하여 다른 함수에서도 사용 가능
+    global tokenizer
     tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
     train_loader, val_loader = create_data_loaders(args, tokenizer, global_rank, world_size)
 
@@ -399,8 +453,10 @@ def main(args):
         max_seq_len=args.max_seq_len, dropout=args.dropout,
         pad_idx=tokenizer.pad_token_id
     ).to(local_rank)
+    
+    # DDP wrapper - broadcast_buffers는 기본값(True) 사용
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, 
-                find_unused_parameters=False, broadcast_buffers=False)  # broadcast_buffers 비활성화
+                find_unused_parameters=False)
 
     optimizer = DistributedShampoo(
         model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2),
@@ -410,7 +466,11 @@ def main(args):
         start_preconditioning_step=args.start_preconditioning_step,
         use_decoupled_weight_decay=True,
         grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
-        distributed_config=DDPShampooConfig(communication_dtype=CommunicationDType.FP32, num_trainers_per_group=-1, communicate_params=False)
+        distributed_config=DDPShampooConfig(
+            communication_dtype=CommunicationDType.FP32, 
+            num_trainers_per_group=-1, 
+            communicate_params=False
+        )
     )
 
     global_step, best_bleu = 0, 0
@@ -421,7 +481,9 @@ def main(args):
         train_loader.sampler.set_epoch(epoch)
 
         start_time = time.time()
-        train_loss, global_step = train_epoch(model, train_loader, optimizer, local_rank, args, global_step)
+        train_loss, global_step = train_epoch(
+            model, train_loader, optimizer, local_rank, args, global_step, writer, global_rank
+        )
         train_time = time.time() - start_time
 
         val_loss = evaluate(model, val_loader, device=local_rank, tokenizer=tokenizer)
@@ -435,30 +497,41 @@ def main(args):
 
         if global_rank == 0:
             lr = optimizer.param_groups[0]['lr']
-            print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | BLEU: {bleu_score:.2f} | LR: {lr:.6f} | Time: {train_time:.1f}s")
+            print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                  f"BLEU: {bleu_score:.2f} | LR: {lr:.6f} | Time: {train_time:.1f}s")
+            
             if writer:
                 writer.add_scalar('Train/Loss', train_loss, global_step)
                 writer.add_scalar('Val/Loss', val_loss, global_step)
-                if (epoch + 1) % args.bleu_interval == 0: writer.add_scalar('Val/BLEU', bleu_score, global_step)
+                if (epoch + 1) % args.bleu_interval == 0: 
+                    writer.add_scalar('Val/BLEU', bleu_score, global_step)
                 writer.add_scalar('Train/LearningRate', lr, global_step)
 
+        # Best 모델 저장
         if bleu_score > best_bleu:
             best_bleu = bleu_score
-            if global_rank == 0: print(f"*** New best BLEU: {best_bleu:.2f} ***")
+            if global_rank == 0: 
+                print(f"*** New best BLEU: {best_bleu:.2f} ***")
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu, 
-                os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"), global_rank)
-            # condition-number.py를 위한 표준 체크포인트 저장
-            save_checkpoint_for_condition_number(model, optimizer, epoch, os.path.join(args.checkpoint_dir, f"best_model_epoch_{epoch+1}.pth"), global_rank)
+                          os.path.join(args.checkpoint_dir, "best_model.pth"), 
+                          global_rank, args)
 
+        # Condition number 분석용 체크포인트
+        if (epoch + 1) % args.condition_analysis_interval == 0:
+            save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
+                          os.path.join(args.checkpoint_dir, f"condition_epoch_{epoch+1}.pth"),
+                          global_rank, args)
+
+        # 정기 체크포인트
         if (epoch + 1) % args.save_interval == 0:
-            checkpoint_dir = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}")
-            save_checkpoint(model, optimizer, epoch, global_step, best_bleu, checkpoint_dir, global_rank)
-            # condition-number.py를 위한 표준 체크포인트 저장
-            save_checkpoint_for_condition_number(model, optimizer, epoch, os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"), global_rank)
+            save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
+                          os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"),
+                          global_rank, args)
 
     if global_rank == 0:
         print(f"\n{'='*50}\nTraining completed! Best BLEU score: {best_bleu:.2f}\n{'='*50}")
-    if writer: writer.close()
+    if writer: 
+        writer.close()
     cleanup()
 
 
@@ -466,39 +539,50 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AlgoPerf Transformer + WMT with Distributed Shampoo')
 
     # Model arguments
-    parser.add_argument('--d-model', type=int, default=1024, help='Model dimension')
-    parser.add_argument('--n-heads', type=int, default=16, help='Number of attention heads')
-    parser.add_argument('--n-layers', type=int, default=6, help='Number of encoder/decoder layers')
-    parser.add_argument('--d-ff', type=int, default=4096, help='Feed-forward dimension')
-    parser.add_argument('--max-seq-len', type=int, default=256, help='Maximum sequence length')
+    parser.add_argument('--d-model', type=int, default=256, help='Model dimension')
+    parser.add_argument('--n-heads', type=int, default=4, help='Number of attention heads')
+    parser.add_argument('--n-layers', type=int, default=4, help='Number of encoder/decoder layers')
+    parser.add_argument('--d-ff', type=int, default=1024, help='Feed-forward dimension')
+    parser.add_argument('--max-seq-len', type=int, default=128, help='Maximum sequence length')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
 
     # Training arguments
     parser.add_argument('--epochs', type=int, default=90, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size per GPU')
-    parser.add_argument('--lr', type=float, default=1.0, help='Base learning rate')
-    parser.add_argument('--warmup-steps', type=int, default=4000, help='Warmup steps')
-    parser.add_argument('--weight-decay', type=float, default=0.0, help='Weight decay')
+    parser.add_argument('--lr', type=float, default=0.0013, help='Base learning rate')
+    parser.add_argument('--warmup-steps', type=int, default=34605, help='Warmup steps')
+    parser.add_argument('--weight-decay', type=float, default=0.001, help='Weight decay')
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
-    parser.add_argument('--beta2', type=float, default=0.98, help='Adam beta2')
+    parser.add_argument('--beta2', type=float, default=0.99, help='Adam beta2')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing')
 
     # Shampoo arguments
-    parser.add_argument('--max-preconditioner-dim', type=int, default=1024, help='Max preconditioner dimension')
-    parser.add_argument('--precondition-frequency', type=int, default=50, help='Preconditioning frequency')
-    parser.add_argument('--start-preconditioning-step', type=int, default=50, help='Step to start preconditioning')
+    parser.add_argument('--max-preconditioner-dim', type=int, default=1024, 
+                       help='Max preconditioner dimension')
+    parser.add_argument('--precondition-frequency', type=int, default=25, 
+                       help='Preconditioning frequency')
+    parser.add_argument('--start-preconditioning-step', type=int, default=25, 
+                       help='Step to start preconditioning')
 
     # Data arguments
-    parser.add_argument('--data-path', type=str, default='./wmt_data', help='Path to cache datasets')
+    parser.add_argument('--data-path', type=str, default='./wmt_data', 
+                       help='Path to cache datasets')
     parser.add_argument('--workers', type=int, default=4, help='Number of data workers')
-    parser.add_argument('--max-train-samples', type=int, default=None, help='Max training samples for debugging')
+    parser.add_argument('--max-train-samples', type=int, default=None, 
+                       help='Max training samples for debugging')
 
     # Logging arguments
-    parser.add_argument('--log-dir', type=str, default='logs/transformer_shampoo', help='TensorBoard log directory')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints/transformer_shampoo', help='Checkpoint directory')
-    parser.add_argument('--save-interval', type=int, default=10, help='Save checkpoint interval')
+    parser.add_argument('--log-dir', type=str, default='logs/transformer_shampoo', 
+                       help='TensorBoard log directory')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints/transformer_shampoo', 
+                       help='Checkpoint directory')
+    parser.add_argument('--save-interval', type=int, default=1, help='Save checkpoint interval')
     parser.add_argument('--bleu-interval', type=int, default=5, help='BLEU evaluation interval')
+    parser.add_argument('--condition-analysis-interval', type=int, default=1,
+                       help='Interval for saving checkpoints for condition number analysis')
+    parser.add_argument('--log-condition-interval', type=int, default=100,
+                       help='Interval for logging condition numbers to TensorBoard')
 
     args = parser.parse_args()
     main(args)
