@@ -1,4 +1,4 @@
-# transformer_algoperf.py (최종 수정본 - 완전판)
+# Transformer.py (수정된 최종 버전)
 
 import os
 import math
@@ -211,16 +211,16 @@ class WMT17Dataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]['translation']
         src_text, tgt_text = item['de'], item['en']
-        src_encoding = self.tokenizer(src_text, max_length=self.max_seq_len, padding='max_length', 
+        src_encoding = self.tokenizer(src_text, max_length=self.max_seq_len, padding='max_length',
                                      truncation=True, return_tensors='pt')
-        tgt_encoding = self.tokenizer(tgt_text, max_length=self.max_seq_len, padding='max_length', 
+        tgt_encoding = self.tokenizer(tgt_text, max_length=self.max_seq_len, padding='max_length',
                                      truncation=True, return_tensors='pt')
-        return {'src': src_encoding['input_ids'].squeeze(0), 'tgt': tgt_encoding['input_ids'].squeeze(0), 
+        return {'src': src_encoding['input_ids'].squeeze(0), 'tgt': tgt_encoding['input_ids'].squeeze(0),
                 'src_text': src_text, 'tgt_text': tgt_text}
 
 
 def create_data_loaders(args, tokenizer, global_rank, world_size):
-    if global_rank == 0: 
+    if global_rank == 0:
         print("Loading WMT datasets...")
     dataset = load_dataset("wmt17", "de-en", cache_dir=args.data_path)
     val_dataset_raw = load_dataset("wmt14", "de-en", cache_dir=args.data_path)
@@ -229,13 +229,13 @@ def create_data_loaders(args, tokenizer, global_rank, world_size):
         train_data = train_data.select(range(min(args.max_train_samples, len(train_data))))
     train_dataset = WMT17Dataset(train_data, tokenizer, args.max_seq_len)
     val_dataset = WMT17Dataset(val_dataset_raw['validation'], tokenizer, args.max_seq_len)
-    if global_rank == 0: 
+    if global_rank == 0:
         print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(val_dataset)}")
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, 
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler,
                             num_workers=args.workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, 
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,
                           num_workers=args.workers, pin_memory=True)
     return train_loader, val_loader
 
@@ -256,7 +256,7 @@ def train_epoch(model, dataloader, optimizer, device, args, global_step, writer,
     """Training epoch with warning fixes"""
     model.train()
     total_loss, total_tokens = 0, 0
-    progress_bar = tqdm(dataloader, desc=f"Epoch {args.current_epoch+1} Training", 
+    progress_bar = tqdm(dataloader, desc=f"Epoch {args.current_epoch+1} Training",
                        disable=(dist.get_rank() != 0))
 
     for batch_idx, batch in enumerate(progress_bar):
@@ -271,13 +271,13 @@ def train_epoch(model, dataloader, optimizer, device, args, global_step, writer,
         optimizer.zero_grad(set_to_none=True)
         output = model(src, tgt_input)
         loss = label_smoothed_cross_entropy(
-            output.reshape(-1, output.size(-1)), 
-            tgt_output.reshape(-1), 
-            epsilon=args.label_smoothing, 
+            output.reshape(-1, output.size(-1)),
+            tgt_output.reshape(-1),
+            epsilon=args.label_smoothing,
             ignore_index=tokenizer.pad_token_id
         )
         loss.backward()
-        
+
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
         optimizer.step()
@@ -288,11 +288,11 @@ def train_epoch(model, dataloader, optimizer, device, args, global_step, writer,
             loss_value = loss.item()  # loss는 이미 backward() 후이므로 detach() 대신 no_grad 사용
             total_loss += loss_value * num_tokens
             total_tokens += num_tokens
-        
+
         # 실시간 condition number 로깅
         if global_rank == 0 and batch_idx % args.log_condition_interval == 0:
             log_condition_numbers(optimizer, writer, global_step)
-        
+
         if dist.get_rank() == 0:
             progress_bar.set_postfix({'loss': loss_value, 'lr': lr})
 
@@ -309,16 +309,16 @@ def evaluate(model, dataloader, device, tokenizer):
             tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
             output = model(src, tgt_input)
             loss = F.cross_entropy(
-                output.reshape(-1, output.size(-1)), 
-                tgt_output.reshape(-1), 
+                output.reshape(-1, output.size(-1)),
+                tgt_output.reshape(-1),
                 ignore_index=tokenizer.pad_token_id
             )
-            
+
             num_tokens = (tgt_output != tokenizer.pad_token_id).sum().item()
             loss_value = loss.item()  # no_grad 컨텍스트 내에서는 안전
             total_loss += loss_value * num_tokens
             total_tokens += num_tokens
-            
+
     return total_loss / total_tokens if total_tokens > 0 else 0
 
 def greedy_decode(model, src, max_len, device, tokenizer):
@@ -336,7 +336,7 @@ def greedy_decode(model, src, max_len, device, tokenizer):
             logits = F.linear(decoder_output[-1, :, :], model.module.shared_embedding.weight)
             next_token = logits.argmax(dim=-1, keepdim=True)
             tgt = torch.cat([tgt, next_token], dim=1)
-            if (next_token == tokenizer.sep_token_id).all(): 
+            if (next_token == tokenizer.sep_token_id).all():
                 break
     return tgt
 
@@ -349,7 +349,7 @@ def compute_bleu(model, dataloader, device, tokenizer, max_decode_len):
             src, tgt_texts = batch['src'].to(device), batch['tgt_text']
             translations = greedy_decode(model, src, max_decode_len, device, tokenizer)
             for i in range(translations.size(0)):
-                hyp_ids = [tid for tid in translations[i].cpu().tolist() 
+                hyp_ids = [tid for tid in translations[i].cpu().tolist()
                           if tid not in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]]
                 hypotheses.append(tokenizer.decode(hyp_ids))
                 references.append(tgt_texts[i])
@@ -368,7 +368,7 @@ def log_condition_numbers(optimizer, writer, global_step):
             for group_idx, state_lists in enumerate(optimizer._per_group_state_lists):
                 if 'SHAMPOO_PRECONDITIONER_LIST' in state_lists:
                     preconditioner_list = state_lists['SHAMPOO_PRECONDITIONER_LIST']
-                    
+
                     # 각 Kronecker factor의 condition number 계산
                     for block_idx, kronecker_factors in enumerate(
                         preconditioner_list._masked_kronecker_factors_list[:10]  # 처음 10개만 로깅
@@ -388,17 +388,55 @@ def log_condition_numbers(optimizer, writer, global_step):
     except Exception as e:
         print(f"Warning: Failed to log condition numbers: {e}")
 
+# [수정] 모든 GPU의 옵티마이저 상태를 수집하는 함수
+def gather_optimizer_state_from_all_ranks(optimizer, model, world_size):
+    """
+    모든 랭크에서 옵티마이저 상태를 수집하고 통합합니다.
+    """
+    # 각 GPU에서 로컬 옵티마이저 상태를 가져옵니다.
+    # [수정] dict()로 감싸지 않고 이터레이터 자체를 전달합니다.
+    local_state = optimizer.distributed_state_dict(
+        key_to_param=model.module.named_parameters()
+    )
 
-def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, global_rank, args):
+    # 모든 GPU의 상태를 담을 리스트를 준비합니다.
+    all_states = [None] * world_size
+    # `all_gather_object`를 사용해 모든 GPU의 `local_state`를 `all_states` 리스트에 모읍니다.
+    dist.all_gather_object(all_states, local_state)
+
+    # rank 0에서만 상태를 병합합니다.
+    if dist.get_rank() == 0:
+        # 병합된 상태를 저장할 딕셔너리를 초기화합니다.
+        merged_state = {
+            'state': {},
+            'param_groups': all_states[0]['param_groups'] # param_groups는 동일하므로 rank 0의 것을 사용
+        }
+
+        # 모든 파라미터 이름을 수집합니다.
+        all_param_keys = set()
+        for state in all_states:
+            if state and 'state' in state:
+                all_param_keys.update(state['state'].keys())
+
+        # 각 파라미터에 대해 모든 GPU의 상태를 병합합니다.
+        for param_key in all_param_keys:
+            merged_state['state'][param_key] = {}
+            for state in all_states:
+                if state and 'state' in state and param_key in state['state']:
+                    merged_state['state'][param_key].update(state['state'][param_key])
+        return merged_state
+    return None
+
+
+def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, global_rank, world_size, args):
     """Save checkpoint with both standard format and Shampoo metadata."""
-    if global_rank == 0:
+
+    # 모든 GPU의 옵티마이저 상태를 수집
+    merged_optimizer_state = gather_optimizer_state_from_all_ranks(optimizer, model, world_size)
+
+    if global_rank == 0 and merged_optimizer_state is not None:
         actual_model = model.module if hasattr(model, 'module') else model
-        
-        # Optimizer state를 표준 형식으로 변환
-        optimizer_state = optimizer.distributed_state_dict(
-            key_to_param=dict(actual_model.named_parameters())
-        )
-        
+
         # Shampoo 설정 메타데이터
         shampoo_config = {
             'beta2': args.beta2,
@@ -407,17 +445,17 @@ def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, g
             'precondition_frequency': args.precondition_frequency,
             'start_preconditioning_step': args.start_preconditioning_step,
         }
-        
+
         checkpoint = {
             'epoch': epoch,
             'step': step,
             'model_state_dict': actual_model.state_dict(),
-            'optimizer_state_dict': optimizer_state,
+            'optimizer_state_dict': merged_optimizer_state, # 병합된 상태 저장
             'best_bleu': best_bleu,
             'shampoo_config': shampoo_config,
-            'args': vars(args),  # 모든 args 저장
+            'args': vars(args),
         }
-        
+
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
 
@@ -453,9 +491,8 @@ def main(args):
         max_seq_len=args.max_seq_len, dropout=args.dropout,
         pad_idx=tokenizer.pad_token_id
     ).to(local_rank)
-    
-    # DDP wrapper - broadcast_buffers는 기본값(True) 사용
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, 
+
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                 find_unused_parameters=False)
 
     optimizer = DistributedShampoo(
@@ -467,8 +504,8 @@ def main(args):
         use_decoupled_weight_decay=True,
         grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
         distributed_config=DDPShampooConfig(
-            communication_dtype=CommunicationDType.FP32, 
-            num_trainers_per_group=-1, 
+            communication_dtype=CommunicationDType.FP32,
+            num_trainers_per_group=-1,
             communicate_params=False
         )
     )
@@ -499,38 +536,35 @@ def main(args):
             lr = optimizer.param_groups[0]['lr']
             print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"BLEU: {bleu_score:.2f} | LR: {lr:.6f} | Time: {train_time:.1f}s")
-            
+
             if writer:
                 writer.add_scalar('Train/Loss', train_loss, global_step)
                 writer.add_scalar('Val/Loss', val_loss, global_step)
-                if (epoch + 1) % args.bleu_interval == 0: 
+                if (epoch + 1) % args.bleu_interval == 0:
                     writer.add_scalar('Val/BLEU', bleu_score, global_step)
                 writer.add_scalar('Train/LearningRate', lr, global_step)
 
-        # Best 모델 저장
         if bleu_score > best_bleu:
             best_bleu = bleu_score
-            if global_rank == 0: 
+            if global_rank == 0:
                 print(f"*** New best BLEU: {best_bleu:.2f} ***")
-            save_checkpoint(model, optimizer, epoch, global_step, best_bleu, 
-                          os.path.join(args.checkpoint_dir, "best_model.pth"), 
-                          global_rank, args)
+            save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
+                          os.path.join(args.checkpoint_dir, "best_model.pth"),
+                          global_rank, world_size, args)
 
-        # Condition number 분석용 체크포인트
         if (epoch + 1) % args.condition_analysis_interval == 0:
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
                           os.path.join(args.checkpoint_dir, f"condition_epoch_{epoch+1}.pth"),
-                          global_rank, args)
+                          global_rank, world_size, args)
 
-        # 정기 체크포인트
         if (epoch + 1) % args.save_interval == 0:
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
                           os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"),
-                          global_rank, args)
+                          global_rank, world_size, args)
 
     if global_rank == 0:
         print(f"\n{'='*50}\nTraining completed! Best BLEU score: {best_bleu:.2f}\n{'='*50}")
-    if writer: 
+    if writer:
         writer.close()
     cleanup()
 
@@ -558,24 +592,24 @@ if __name__ == '__main__':
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing')
 
     # Shampoo arguments
-    parser.add_argument('--max-preconditioner-dim', type=int, default=1024, 
+    parser.add_argument('--max-preconditioner-dim', type=int, default=1024,
                        help='Max preconditioner dimension')
-    parser.add_argument('--precondition-frequency', type=int, default=25, 
+    parser.add_argument('--precondition-frequency', type=int, default=25,
                        help='Preconditioning frequency')
-    parser.add_argument('--start-preconditioning-step', type=int, default=25, 
+    parser.add_argument('--start-preconditioning-step', type=int, default=25,
                        help='Step to start preconditioning')
 
     # Data arguments
-    parser.add_argument('--data-path', type=str, default='./wmt_data', 
+    parser.add_argument('--data-path', type=str, default='./wmt_data',
                        help='Path to cache datasets')
     parser.add_argument('--workers', type=int, default=4, help='Number of data workers')
-    parser.add_argument('--max-train-samples', type=int, default=None, 
+    parser.add_argument('--max-train-samples', type=int, default=None,
                        help='Max training samples for debugging')
 
     # Logging arguments
-    parser.add_argument('--log-dir', type=str, default='logs/transformer_shampoo', 
+    parser.add_argument('--log-dir', type=str, default='logs/transformer_shampoo',
                        help='TensorBoard log directory')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints/transformer_shampoo', 
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints/transformer_shampoo',
                        help='Checkpoint directory')
     parser.add_argument('--save-interval', type=int, default=1, help='Save checkpoint interval')
     parser.add_argument('--bleu-interval', type=int, default=5, help='BLEU evaluation interval')
